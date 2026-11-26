@@ -657,7 +657,9 @@ sealed class CharacterPuzzleReader : IDisposable
         public IEnumerable<(string Glyph, double X, double Y)> Read(string imagePath) =>
             ReadAsync(imagePath).GetAwaiter().GetResult();
 
-        public void Dispose() => engine.Dispose();
+        public void Dispose()
+        {
+        }
 
         private async Task<List<(string Glyph, double X, double Y)>> ReadAsync(string imagePath)
         {
