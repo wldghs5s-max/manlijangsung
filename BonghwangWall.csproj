@@ -1,14 +1,16 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework Condition="!$([MSBuild]::IsOSPlatform('Windows'))">net10.0</TargetFramework>
+    <TargetFramework Condition="$([MSBuild]::IsOSPlatform('Windows'))">net10.0-windows10.0.19041.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <PlatformTarget>x64</PlatformTarget>
+    <PlatformTarget Condition="$([MSBuild]::IsOSPlatform('Windows'))">x64</PlatformTarget>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="OpenCvSharp5" Version="5.1.0.20261115" />
     <PackageReference Include="OpenCvSharp5.runtime.win" Version="5.1.0.20261115" />
+    <PackageReference Include="OpenCvSharp5.runtime.osx.arm64" Version="5.1.0.20261115" Condition="!$([MSBuild]::IsOSPlatform('Windows'))" />
     <None Update="Templates/**/*.png" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
