@@ -6,13 +6,21 @@ Console.OutputEncoding = Encoding.UTF8;
 const int brickPurchaseQuantity = 100;
 const int questTarget = 10_000;
 const string defaultRecording = "public/만리장성수리.mp4";
-const string usage = "사용법: dotnet run -- [--verify] [--pilot] [영상.mp4]";
+const string usage =
+    "사용법: BonghwangWall.exe [--verify] [--pilot] [--live] [--dry-run] [--window 제목 | --screen] [영상.mp4]\n" +
+    "인자 없이 실행하면 실시간 대기 모드로 시작합니다. (F11: 시작/일시정지, END: 종료)";
 
+bool noArgs = args.Length == 0;
 bool verify = false;
 bool pilot = false;
+bool live = noArgs && OperatingSystem.IsWindows();
+bool dryRun = false;
+bool screenOnly = false;
+string? windowTitle = null;
 string? recording = null;
-foreach (string arg in args)
+for (int i = 0; i < args.Length; i++)
 {
+    string arg = args[i];
     if (arg is "--help" or "-h")
     {
         Console.WriteLine(usage);
@@ -28,6 +36,26 @@ foreach (string arg in args)
         pilot = true;
         continue;
     }
+    if (arg == "--live")
+    {
+        live = true;
+        continue;
+    }
+    if (arg == "--dry-run")
+    {
+        dryRun = true;
+        continue;
+    }
+    if (arg == "--screen")
+    {
+        screenOnly = true;
+        continue;
+    }
+    if (arg == "--window" && i + 1 < args.Length)
+    {
+        windowTitle = args[++i];
+        continue;
+    }
     if (arg.StartsWith('-') || recording is not null)
     {
         Console.Error.WriteLine(usage);
@@ -38,6 +66,15 @@ foreach (string arg in args)
 
 try
 {
+    if (live)
+        return LiveRunner.Run(new LiveOptions
+        {
+            DryRun = dryRun,
+            Screen = screenOnly,
+            WindowTitle = windowTitle,
+            PurchaseQuantity = brickPurchaseQuantity
+        });
+
     if (pilot)
         return RunPilot();
 
@@ -83,10 +120,14 @@ try
     Console.WriteLine($"집계 벽돌 {counter.Consumed}개 소모 | 확인 보류 {counter.Uncertain}건 | 재구매 시점 {counter.Refills}회 | 분석 {frameIndex:N0}프레임");
     return verify ? CompareReadings(puzzles.Readings) : 0;
 }
-catch (Exception error) when (error is IOException or InvalidDataException or ArgumentException or OpenCVException or
-    TypeInitializationException or DllNotFoundException or BadImageFormatException or InvalidOperationException)
+catch (Exception error)
 {
-    Console.Error.WriteLine(error.GetBaseException().Message);
+    Console.Error.WriteLine(error);
+    if (noArgs && !Console.IsInputRedirected)
+    {
+        Console.WriteLine("종료하려면 Enter 키를 누르세요...");
+        Console.ReadLine();
+    }
     return 1;
 }
 
@@ -103,11 +144,142 @@ static int RunPilot()
         WallAtlas.Jangan, null, "장안성"));
     failures.AddRange(ExpectPlace(hud, "public/만리장성수리.mp4", TimeSpan.FromSeconds(12.5), TimeSpan.FromSeconds(17),
         WallAtlas.Wall3, null, "만리장성3", true));
+    if (hud.SupportedWalls.Count != 4)
+        failures.Add($"만리장성 1~4 템플릿이 모두 필요합니다. 현재: {string.Join(", ", hud.SupportedWalls)}");
+    failures.AddRange(ExpectWorldMap(hud, "public/만리장성수리.mp4", TimeSpan.FromSeconds(7), TimeSpan.FromSeconds(10.5)));
+    failures.AddRange(ExpectSmithyDialogs(hud, "public/벽돌구매.mp4", TimeSpan.FromSeconds(13), TimeSpan.FromSeconds(18.5)));
+    failures.AddRange(ExpectTransitionSequence(hud, "public/MapleStory Worlds-신바람_ 봉황 2026-11-26 21-44-05.mp4",
+        [WallAtlas.Wall3, WallAtlas.Wall4, WallAtlas.Wall3], "만리장성 3↔4"));
+    failures.AddRange(ExpectTransitionSequence(hud, "public/MapleStory Worlds-신바람_ 봉황 2026-11-26 21-44-26.mp4",
+        [WallAtlas.Wall3, WallAtlas.Wall2, WallAtlas.Wall3], "만리장성 3↔2"));
+    failures.AddRange(ExpectTransitionSequence(hud, "public/MapleStory Worlds-신바람_ 봉황 2026-11-26 21-45-01.mp4",
+        [WallAtlas.Wall2, WallAtlas.Wall1, WallAtlas.Wall2], "만리장성 2↔1"));
     foreach (string failure in failures)
         Console.WriteLine("실패 " + failure);
     if (failures.Count == 0)
-        Console.WriteLine("리허설 통과 | 성문 이탈 없음 | 만리장성 맵 이동 | 풍신보 1초 | 비서 U 다음 M | 다리 경로 | 화면 좌표");
+        Console.WriteLine("리허설 통과 | 성문 이탈 없음 | 만리장성 1~4 맵 이동 | 풍신보 1초 | 비서 U 다음 M | 다리 경로 | 화면 좌표 | 지역지도 | 대장간 구매");
     return failures.Count == 0 ? 0 : 4;
+}
+
+static List<string> ExpectTransitionSequence(HudReader hud, string recording, string[] expectedSequence, string label)
+{
+    string path = Path.GetFullPath(recording);
+    if (!File.Exists(path))
+        return [$"{label} 영상 없음"];
+
+    using var video = File.OpenRead(path);
+    using var capture = new VideoCapture(video, VideoCaptureAPIs.FFMPEG, Array.Empty<int>());
+    using var frame = new Mat();
+    using var screen = new RepairScreen();
+    var observed = new List<string>();
+    var coordsSeen = new HashSet<string>(StringComparer.Ordinal);
+    bool falseWorldMap = false;
+    bool falseAbsent = false;
+    bool falseReturnConfirm = false;
+    bool falseUnknownDialog = false;
+
+    while (capture.Read(frame) && !frame.Empty())
+    {
+        if (hud.IsWorldMap(frame))
+            falseWorldMap = true;
+        if (hud.IsReturnConfirmDialog(frame))
+            falseReturnConfirm = true;
+        if (screen.IsDialogPanelOpen(frame) || hud.HasCenterParchmentDialog(frame))
+            falseUnknownDialog = true;
+        if (screen.ReadStock(frame) == BrickStock.Absent)
+            falseAbsent = true;
+        hud.Read(frame, out string? map, out int? x, out int? y);
+        if (map is not null && x is not null && y is not null)
+            coordsSeen.Add(map);
+        if (map is not null && (observed.Count == 0 || observed[^1] != map))
+            observed.Add(map);
+    }
+
+    var failures = new List<string>();
+    if (!observed.SequenceEqual(expectedSequence))
+        failures.Add($"{label} 전환 순서 불일치: 기대 [{string.Join("→", expectedSequence)}], 실제 [{string.Join("→", observed)}]");
+    foreach (string expected in expectedSequence.Distinct())
+    {
+        if (!coordsSeen.Contains(expected))
+            failures.Add($"{label} 좌표 판독 누락: {expected}");
+    }
+    if (falseWorldMap)
+        failures.Add($"{label} 영상에서 지역지도 오검출 발생");
+    if (falseReturnConfirm)
+        failures.Add($"{label} 영상에서 귀환 확인창 오검출 발생");
+    if (falseUnknownDialog)
+        failures.Add($"{label} 영상에서 미확인 대화창 오검출 발생");
+    if (falseAbsent)
+        failures.Add($"{label} 영상에서 벽돌 없음(Absent) 오검출 발생");
+    if (failures.Count == 0)
+        Console.WriteLine($"화면 {label} | 전환 {string.Join("→", observed)} | 오검출 없음");
+    return failures;
+}
+
+static List<string> ExpectWorldMap(HudReader hud, string recording, TimeSpan from, TimeSpan to)
+{
+    string path = Path.GetFullPath(recording);
+    if (!File.Exists(path))
+        return ["지역지도 영상 없음"];
+
+    using var video = File.OpenRead(path);
+    using var capture = new VideoCapture(video, VideoCaptureAPIs.FFMPEG, Array.Empty<int>());
+    using var frame = new Mat();
+    double fps = capture.Fps;
+    int frameIndex = 0;
+    while (capture.Read(frame) && !frame.Empty())
+    {
+        double seconds = capture.Get(VideoCaptureProperties.PosMsec) / 1000;
+        if (!double.IsFinite(seconds) || seconds < 0 || (seconds == 0 && frameIndex > 0))
+            seconds = fps > 0 ? frameIndex / fps : 0;
+        frameIndex++;
+        if (seconds < from.TotalSeconds)
+            continue;
+        if (seconds > to.TotalSeconds)
+            break;
+        if (hud.IsWorldMap(frame))
+        {
+            Console.WriteLine($"화면 지역지도 | {seconds:0.0}초");
+            return [];
+        }
+    }
+    return ["지역지도 화면을 판별하지 못했습니다."];
+}
+
+static List<string> ExpectSmithyDialogs(HudReader hud, string recording, TimeSpan from, TimeSpan to)
+{
+    string path = Path.GetFullPath(recording);
+    if (!File.Exists(path))
+        return ["대장간 영상 없음"];
+
+    using var video = File.OpenRead(path);
+    using var capture = new VideoCapture(video, VideoCaptureAPIs.FFMPEG, Array.Empty<int>());
+    using var frame = new Mat();
+    var seen = new HashSet<SmithyDialogState>();
+    double fps = capture.Fps;
+    int frameIndex = 0;
+    while (capture.Read(frame) && !frame.Empty())
+    {
+        double seconds = capture.Get(VideoCaptureProperties.PosMsec) / 1000;
+        if (!double.IsFinite(seconds) || seconds < 0 || (seconds == 0 && frameIndex > 0))
+            seconds = fps > 0 ? frameIndex / fps : 0;
+        frameIndex++;
+        if (seconds < from.TotalSeconds)
+            continue;
+        if (seconds > to.TotalSeconds)
+            break;
+        seen.Add(hud.ReadSmithyDialog(frame));
+    }
+
+    var missing = new List<string>();
+    foreach (SmithyDialogState state in new[] { SmithyDialogState.MainMenu, SmithyDialogState.ItemList, SmithyDialogState.QuantityPrompt })
+    {
+        if (!seen.Contains(state))
+            missing.Add($"대장간 대화창 {state} 미검출");
+    }
+    if (missing.Count == 0)
+        Console.WriteLine("화면 대장간 대화 | MainMenu, ItemList, QuantityPrompt 확인");
+    return missing;
 }
 
 static List<string> ExpectPlace(HudReader hud, string recording, TimeSpan from, TimeSpan to, string map, int? y, string label, bool requireCoordinate = false)

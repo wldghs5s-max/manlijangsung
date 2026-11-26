@@ -14,12 +14,16 @@ sealed class RepairCounter
     private TimeSpan lastCrackSeen;
     private int consumedSinceSupply;
     private bool resultReported;
+    private bool autoStockTriggered;
+    private int visibleStockStreak;
+    private TimeSpan absentSince = TimeSpan.MinValue;
 
     public RepairCounter(int purchaseQuantity) => this.purchaseQuantity = purchaseQuantity;
 
     public int Consumed { get; private set; }
     public int Uncertain { get; private set; }
     public int Refills { get; private set; }
+    public bool NeedsBricks { get; private set; }
 
     public void Observe(RepairScreen screen, Mat frame, TimeSpan time)
     {
@@ -81,7 +85,52 @@ sealed class RepairCounter
             : $"이번 구매분에서 벽돌 {consumedSinceSupply}개 소모";
         Refills++;
         consumedSinceSupply = 0;
+        NeedsBricks = true;
+        autoStockTriggered = false;
         Write(candidateSince, "재구매 시점", reason, $"국내성 털보네대장간에서 {purchaseQuantity}개 구매");
+    }
+
+    public void ObserveStock(BrickStock stock, TimeSpan time, bool allowAutoCancel = true)
+    {
+        if (stock == BrickStock.Absent)
+        {
+            visibleStockStreak = 0;
+            if (absentSince == TimeSpan.MinValue)
+                absentSince = time;
+            else if (time - absentSince >= TimeSpan.FromSeconds(3))
+            {
+                if (!NeedsBricks)
+                {
+                    NeedsBricks = true;
+                    autoStockTriggered = true;
+                }
+            }
+            return;
+        }
+
+        absentSince = TimeSpan.MinValue;
+        if (stock is BrickStock.One or BrickStock.Two or BrickStock.QuantityVisible)
+        {
+            visibleStockStreak++;
+            if (allowAutoCancel && autoStockTriggered && NeedsBricks && visibleStockStreak >= 2)
+            {
+                NeedsBricks = false;
+                autoStockTriggered = false;
+            }
+        }
+        else
+        {
+            visibleStockStreak = 0;
+        }
+    }
+
+    public void MarkSupplied()
+    {
+        NeedsBricks = false;
+        autoStockTriggered = false;
+        visibleStockStreak = 0;
+        consumedSinceSupply = 0;
+        absentSince = TimeSpan.MinValue;
     }
 
     public void Complete()
