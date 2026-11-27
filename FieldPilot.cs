@@ -39,7 +39,8 @@ sealed record FieldView(
     bool WorldMapOpen = false,
     SmithyDialogState SmithyDialog = SmithyDialogState.None,
     BrickStock Stock = BrickStock.Unknown,
-    bool ReturnConfirmOpen = false);
+    bool ReturnConfirmOpen = false,
+    bool PuzzleOpen = false);
 
 sealed record FieldCommand(
     FieldKey? Hold,
@@ -258,6 +259,12 @@ sealed class FieldPilot
 
     private FieldCommand DecideCore(FieldView view)
     {
+        if (view.PuzzleOpen)
+        {
+            ResetStuck(view.Now);
+            return Wait("허풍선 글자를 읽는 중");
+        }
+
         if (view.UiBlocked)
         {
             ResetStuck(view.Now);
@@ -1624,6 +1631,25 @@ sealed class FieldInput : IDisposable
         ActiveHold = null;
     }
 
+    public void TypePuzzleAnswer(string answer)
+    {
+        if (!OperatingSystem.IsWindows() || dryRun || answer.Length == 0)
+            return;
+        if (targetWindow != 0 && GetForegroundWindow() != targetWindow)
+            return;
+
+        ReleaseAll();
+        PerformClick(PuzzleFieldClick);
+        Thread.Sleep(60);
+        for (int i = 0; i < 8; i++)
+            TapVirtualKey(0x08);
+        EnsureHangulIme();
+        TypeDubeolsik(HangulKeyboard.ToDubeolsik(answer));
+        CompleteHangulComposition();
+        Thread.Sleep(80);
+        PerformClick(PuzzleOkClick);
+    }
+
     public void Dispose() => ReleaseAll();
 
     private void PerformClick(ClickTarget click)
@@ -1653,11 +1679,97 @@ sealed class FieldInput : IDisposable
         }
     }
 
+    private static readonly ClickTarget PuzzleFieldClick = new(860, 932);
+    private static readonly ClickTarget PuzzleOkClick = new(644, 987);
+
     private static void Tap(FieldKey key)
     {
         SendKey(key, keyUp: false);
         Thread.Sleep(25);
         SendKey(key, keyUp: true);
+    }
+
+    private static void TapVirtualKey(ushort vk)
+    {
+        SendVirtualKey(vk, keyUp: false);
+        Thread.Sleep(16);
+        SendVirtualKey(vk, keyUp: true);
+        Thread.Sleep(16);
+    }
+
+    private static void TypeDubeolsik(string keys)
+    {
+        bool shiftDown = false;
+        try
+        {
+            foreach (char ch in keys)
+            {
+                bool shift = char.IsUpper(ch);
+                ushort vk = (ushort)char.ToUpperInvariant(ch);
+                if (vk is < (ushort)'A' or > (ushort)'Z')
+                    continue;
+                if (shift && !shiftDown)
+                {
+                    SendVirtualKey(0x10, keyUp: false);
+                    shiftDown = true;
+                    Thread.Sleep(12);
+                }
+                else if (!shift && shiftDown)
+                {
+                    SendVirtualKey(0x10, keyUp: true);
+                    shiftDown = false;
+                    Thread.Sleep(12);
+                }
+
+                SendVirtualKey(vk, keyUp: false);
+                Thread.Sleep(18);
+                SendVirtualKey(vk, keyUp: true);
+                Thread.Sleep(22);
+            }
+        }
+        finally
+        {
+            if (shiftDown)
+                SendVirtualKey(0x10, keyUp: true);
+        }
+    }
+
+    private void EnsureHangulIme()
+    {
+        if (targetWindow == 0)
+            return;
+        nint context = ImmGetContext(targetWindow);
+        if (context == 0)
+            return;
+        try
+        {
+            if (!ImmGetConversionStatus(context, out int conversion, out int sentence))
+                return;
+            const int hangul = 0x1;
+            if ((conversion & hangul) == 0)
+                ImmSetConversionStatus(context, conversion | hangul, sentence);
+        }
+        finally
+        {
+            ImmReleaseContext(targetWindow, context);
+        }
+    }
+
+    private void CompleteHangulComposition()
+    {
+        if (targetWindow == 0)
+            return;
+        nint context = ImmGetContext(targetWindow);
+        if (context == 0)
+            return;
+        try
+        {
+            ImmNotifyIME(context, 0x0015, 0x0001, 0);
+        }
+        finally
+        {
+            ImmReleaseContext(targetWindow, context);
+        }
     }
 
     private static void SendKey(FieldKey key, bool keyUp)
@@ -1667,6 +1779,25 @@ sealed class FieldInput : IDisposable
             return;
 
         uint flags = (keyUp ? KeyEventFKeyUp : 0u) | (IsExtendedKey(key) ? KeyEventFExtendedKey : 0u);
+        var input = new Input
+        {
+            Type = InputKeyboard,
+            Data = new InputUnion
+            {
+                Keyboard = new KeyboardInput
+                {
+                    VirtualKey = vk,
+                    ScanCode = (ushort)MapVirtualKeyW(vk, 0),
+                    Flags = flags
+                }
+            }
+        };
+        SendInput(1, [input], Marshal.SizeOf<Input>());
+    }
+
+    private static void SendVirtualKey(ushort vk, bool keyUp)
+    {
+        uint flags = keyUp ? KeyEventFKeyUp : 0u;
         var input = new Input
         {
             Type = InputKeyboard,
@@ -1740,6 +1871,21 @@ sealed class FieldInput : IDisposable
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint SendInput(uint inputs, Input[] data, int size);
 
+    [DllImport("imm32.dll")]
+    private static extern nint ImmGetContext(nint hWnd);
+
+    [DllImport("imm32.dll")]
+    private static extern bool ImmReleaseContext(nint hWnd, nint context);
+
+    [DllImport("imm32.dll")]
+    private static extern bool ImmGetConversionStatus(nint context, out int conversion, out int sentence);
+
+    [DllImport("imm32.dll")]
+    private static extern bool ImmSetConversionStatus(nint context, int conversion, int sentence);
+
+    [DllImport("imm32.dll")]
+    private static extern bool ImmNotifyIME(nint context, uint action, uint index, uint value);
+
     [StructLayout(LayoutKind.Sequential)]
     private struct NativePoint(int x, int y)
     {
@@ -1807,6 +1953,9 @@ static class FieldRehearsal
     {
         var failures = new List<string>();
         CheckDialogStops(failures);
+        CheckPuzzleStopsMovement(failures);
+        CheckHangulKeystrokes(failures);
+        CheckPuzzleAutoLimit(failures);
         CheckRepairDialogTapsEnter(failures);
         CheckBrickRunStartsWithSecretary(failures);
         CheckReturnConfirmClicksYesThenEnter(failures);
@@ -1842,6 +1991,72 @@ static class FieldRehearsal
         FieldCommand command = pilot.Decide(new FieldView(WallAtlas.Wall3, 16, 46, false, true, TimeSpan.FromSeconds(3)));
         if (command.Hold is not null || command.Dash || command.Tap is not null || command.Click is not null)
             failures.Add("대화가 열린 동안 이동 키가 나갔습니다.");
+    }
+
+    private static void CheckPuzzleStopsMovement(List<string> failures)
+    {
+        var pilot = new FieldPilot(new Random(1));
+        FieldCommand command = pilot.Decide(new FieldView(WallAtlas.Wall3, 16, 46, false, false, TimeSpan.FromSeconds(3), PuzzleOpen: true));
+        if (command.Hold is not null || command.Dash || command.Tap is not null || command.Click is not null)
+            failures.Add("허풍선이 열린 동안 이동 키가 나갔습니다.");
+    }
+
+    private static void CheckHangulKeystrokes(List<string> failures)
+    {
+        if (HangulKeyboard.ToDubeolsik("사다마사주람") != "tkekaktkwnfka")
+            failures.Add("사다마사주람의 두벌식 자판 변환이 맞지 않습니다.");
+        if (HangulKeyboard.ToDubeolsik("파성령연지청") != "vktjdfudduswlcjd")
+            failures.Add("파성령연지청의 두벌식 자판 변환이 맞지 않습니다.");
+        if (HangulKeyboard.ToDubeolsik("까") != "Rk" || HangulKeyboard.ToDubeolsik("의") != "dml")
+            failures.Add("겹받침과 쌍자음 두벌식 변환이 맞지 않습니다.");
+    }
+
+    private static void CheckPuzzleAutoLimit(List<string> failures)
+    {
+        var ledger = new PuzzleLedger();
+        var time = TimeSpan.Zero;
+        ledger.OnFrame(true, 1, time, null, null);
+        if (!ledger.CanAutoType)
+            failures.Add("첫 회차에 자동 입력이 막혀 있습니다.");
+        ledger.NoteAutoTyped("가나다라마바", "테스트");
+        if (ledger.CanAutoType)
+            failures.Add("같은 회차에 두 번 입력합니다.");
+        ledger.OnFrame(true, 2, time += TimeSpan.FromSeconds(1), "가나다라마바", "실패판독");
+        if (!ledger.CanAutoType)
+            failures.Add("두 번째 회차 자동 입력이 막혀 있습니다.");
+        ledger.NoteAutoTyped("사아자차카타", "테스트");
+        ledger.OnFrame(true, 3, time += TimeSpan.FromSeconds(1), "사아자차카타", "실패판독");
+        if (ledger.CanAutoType)
+            failures.Add("세 번째 기회까지 자동 입력합니다.");
+        if (!ledger.HandedToUser)
+            failures.Add("두 번 실패 후 사용자에게 넘기지 않았습니다.");
+        ledger.OnFrame(false, 0, time += TimeSpan.FromSeconds(1), null, null);
+        if (!ledger.TryFinish(false, time + TimeSpan.FromSeconds(1.2), out string handed, out _) || handed != "사용자마무리")
+            failures.Add("두 번 실패 후 직접 닫으면 사용자 마무리여야 합니다: " + handed);
+
+        var success = new PuzzleLedger();
+        success.OnFrame(true, 1, TimeSpan.Zero, null, null);
+        success.NoteAutoTyped("사다마사주람", "테스트");
+        success.OnFrame(false, 0, TimeSpan.FromSeconds(2), null, null);
+        if (!success.TryFinish(false, TimeSpan.FromSeconds(3.2), out string won, out _) || won != "2회내성공")
+            failures.Add("한 번 입력 후 창이 닫히면 2회 내 성공이어야 합니다: " + won);
+
+        var gaveUp = new PuzzleLedger();
+        gaveUp.OnFrame(true, 4, TimeSpan.Zero, null, null);
+        gaveUp.Handoff("6초 안에 여섯 글자를 확정하지 못함");
+        if (gaveUp.CanAutoType)
+            failures.Add("확정 실패 후에도 자동 입력을 계속합니다.");
+        gaveUp.OnFrame(false, 0, TimeSpan.FromSeconds(2), null, null);
+        if (!gaveUp.TryFinish(false, TimeSpan.FromSeconds(3.2), out string manual, out _) || manual != "사용자마무리")
+            failures.Add("직접 마무리 기록이 아닙니다: " + manual);
+
+        var lost = new PuzzleLedger();
+        lost.OnFrame(true, 1, TimeSpan.Zero, null, null);
+        lost.Handoff("6초 안에 여섯 글자를 확정하지 못함");
+        lost.OnFrame(true, 2, TimeSpan.FromSeconds(2), "미확정", "표 없음");
+        lost.OnFrame(false, 0, TimeSpan.FromSeconds(4), null, null);
+        if (!lost.TryFinish(false, TimeSpan.FromSeconds(5.2), out string failed, out _) || failed != "실패")
+            failures.Add("사용자 처리 중 실패가 실패로 기록되지 않습니다: " + failed);
     }
 
     private static void CheckRepairDialogTapsEnter(List<string> failures)

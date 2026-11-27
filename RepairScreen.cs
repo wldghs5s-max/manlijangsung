@@ -44,7 +44,7 @@ sealed class RepairScreen : IDisposable
 
     public RepairScreen()
     {
-        string templates = Path.Combine(AppContext.BaseDirectory, "Templates");
+        string templates = BundledFiles.TemplateDirectory;
         panel = LoadImage(Path.Combine(templates, "repair-panel.png"), PanelArea);
         crack = LoadMask(Path.Combine(templates, "crack.png"), DialogArea, TextThreshold, ThresholdTypes.BinaryInv);
         brickUsed =

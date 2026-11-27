@@ -53,7 +53,7 @@ sealed class HudReader : IDisposable
 
     public HudReader()
     {
-        string root = Path.Combine(AppContext.BaseDirectory, "Templates", "hud");
+        string root = Path.Combine(BundledFiles.TemplateDirectory, "hud");
         var loadedTitles = new List<(string Name, Mat Image)>
         {
             LoadTitle(root, "title-guknae.png", WallAtlas.Guknae),

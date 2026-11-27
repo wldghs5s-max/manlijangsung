@@ -79,6 +79,7 @@ static class LiveRunner
 
         using var screen = new RepairScreen();
         using var hud = new HudReader();
+        using var puzzles = new CharacterPuzzleReader("live");
         var vision = new WallVision();
         var counter = new RepairCounter(options.PurchaseQuantity);
         var pilot = new FieldPilot(new Random(), hud.SupportedWalls, options.PurchaseQuantity);
@@ -104,6 +105,8 @@ static class LiveRunner
         bool loggedCaptureSize = false;
         bool warnedFocus = false;
         bool wasInBuy = false;
+        bool puzzleFocusLogged = false;
+        using var puzzleArchive = new PuzzleArchive(Path.Combine(AppContext.BaseDirectory, "허풍선기록"));
 
         log.Write("==================================================");
         log.Write("  봉황 만리장성 자동 진행");
@@ -111,7 +114,11 @@ static class LiveRunner
         log.Write($"  로그 파일: {log.LogPath}");
         log.Write("  F11 : 시작 / 일시정지");
         log.Write("  END : 즉시 종료");
+        log.Write("  허풍선 자동 입력은 2회까지입니다. 두 번 실패하면 알림 후 일시정지합니다.");
+        log.Write("  허풍선 영상과 결과는 exe 옆 허풍선기록 폴더에 남깁니다.");
         log.Write("==================================================");
+        log.Write(MotherboardBeep.Probe());
+        log.Write(AlertSound.EnableLoudOutput());
         log.Write("[대기 중] 게임 창을 띄운 뒤 F11 키를 눌러 시작하세요.");
 
         try
@@ -161,6 +168,7 @@ static class LiveRunner
                     unknownDialogSince = TimeSpan.MinValue;
                     loggedCaptureSize = false;
                     warnedFocus = false;
+                    puzzleFocusLogged = false;
 
                     string titleText = targetWindow == 0 ? "주 모니터 전체 화면" : GetWindowTitle(targetWindow);
                     string rectNote = targetWindow == 0 ? "" : $" | HWND=0x{targetWindow:X} {DescribeClientRect(targetWindow)}";
@@ -219,6 +227,7 @@ static class LiveRunner
                 }
 
                 TimeSpan now = clock.Elapsed;
+                bool puzzleBusy = false;
                 try
                 {
                     RepairDialog dialog = screen.ReadDialog(normalized);
@@ -230,7 +239,40 @@ static class LiveRunner
                         ? hud.ReadSmithyDialog(normalized)
                         : SmithyDialogState.None;
 
-                    bool unknownDialog = !worldMap
+                    puzzles.Observe(normalized, now);
+                    bool puzzleOpen = puzzles.IsOpen;
+                    string? puzzleRecord = puzzleArchive.Observe(normalized, now, puzzleOpen, puzzles.OpenAttempt, puzzles.Readings);
+                    puzzleBusy = puzzleOpen || puzzleArchive.Capturing;
+                    if (puzzleRecord is { Length: > 0 })
+                        log.Write($"[{now:hh\\:mm\\:ss}] {puzzleRecord}");
+                    if (puzzleArchive.JustOpened)
+                    {
+                        log.Write($"[{now:hh\\:mm\\:ss}] 허풍선 1회차 감지");
+                        AlertSound.Play();
+                    }
+                    else if (puzzleArchive.JustRestarted)
+                    {
+                        string fresh = puzzleArchive.RestartReason is null ? "" : " | " + puzzleArchive.RestartReason;
+                        log.Write($"[{now:hh\\:mm\\:ss}] 허풍선 {puzzleArchive.EpisodeAttempt}회차 | 새 미니게임 | 이전 글자는 사용하지 않음{fresh}");
+                        AlertSound.Play();
+                        if (!puzzleArchive.CanAutoType)
+                        {
+                            input.ReleaseAll();
+                            hotkey.ForcePause();
+                            log.Write($"[{now:hh\\:mm\\:ss}] [일시정지] 허풍선 2회 실패. 알림만 울리고 키 입력을 멈춥니다. 직접 입력한 뒤 F11로 재개하세요.");
+                            continue;
+                        }
+                    }
+                    if (puzzleOpen && puzzles.OpenError is string puzzleError && puzzleArchive.CanAutoType)
+                    {
+                        input.ReleaseAll();
+                        puzzleArchive.Handoff("글자 인식 오류: " + puzzleError);
+                        log.Write($"[{now:hh\\:mm\\:ss}] 허풍선 글자를 읽지 못해 자동 입력을 넘깁니다. {puzzleError}");
+                        AlertSound.Play();
+                    }
+
+                    bool unknownDialog = !puzzleOpen
+                        && !worldMap
                         && dialog == RepairDialog.None
                         && !returnConfirm
                         && map != WallAtlas.Smith
@@ -247,7 +289,7 @@ static class LiveRunner
                             hotkey.ForcePause();
                             unknownDialogSince = TimeSpan.MinValue;
                             log.Write($"[{now:hh\\:mm\\:ss}] [자동 일시정지] 수리 창 외의 팝업/대화창이 감지되어 이동을 멈추고 일시정지합니다. 직접 처리한 뒤 게임 창에서 F11 키를 눌러 재개하세요.");
-                            TryAlertBeep();
+                            AlertSound.Play();
                             Thread.Sleep(100);
                             continue;
                         }
@@ -257,7 +299,7 @@ static class LiveRunner
                         unknownDialogSince = TimeSpan.MinValue;
                     }
 
-                    if (worldMap || dialog != RepairDialog.None || returnConfirm || smithyDialog != SmithyDialogState.None || unknownDialog)
+                    if (worldMap || dialog != RepairDialog.None || returnConfirm || smithyDialog != SmithyDialogState.None || unknownDialog || puzzleOpen || puzzleArchive.Capturing)
                     {
                         lastKnownMap = null;
                         lastKnownX = null;
@@ -287,7 +329,9 @@ static class LiveRunner
                         && !worldMap
                         && dialog == RepairDialog.None
                         && !returnConfirm
-                        && !unknownDialog)
+                        && !unknownDialog
+                        && !puzzleOpen
+                        && !puzzleArchive.Capturing)
                     {
                         List<TileScan> scans = vision.Scan(normalized, map, px, py);
                         pilot.ObserveTerrain(map, scans, now);
@@ -301,7 +345,7 @@ static class LiveRunner
                     }
 
                     counter.Observe(screen, normalized, now);
-                    if (map is not null && !worldMap && dialog == RepairDialog.None && !returnConfirm && !unknownDialog)
+                    if (map is not null && !worldMap && dialog == RepairDialog.None && !returnConfirm && !unknownDialog && !puzzleOpen && !puzzleArchive.Capturing)
                         counter.ObserveStock(stock, now, allowAutoCancel: !pilot.IsSupplying || !pilot.InBuyPhase);
 
                     var view = new FieldView(
@@ -315,7 +359,8 @@ static class LiveRunner
                         WorldMapOpen: worldMap,
                         SmithyDialog: smithyDialog,
                         Stock: stock,
-                        ReturnConfirmOpen: returnConfirm);
+                        ReturnConfirmOpen: returnConfirm,
+                        PuzzleOpen: puzzleOpen || puzzleArchive.Capturing);
 
                     FieldCommand command = pilot.Decide(view);
                     if (wasInBuy && !pilot.InBuyPhase)
@@ -334,6 +379,48 @@ static class LiveRunner
                     }
 
                     input.Apply(command);
+                    if (puzzleOpen
+                        && puzzleArchive.CanAutoType
+                        && puzzles.TryCurrentAnswer(now, out string puzzleAnswer, out string puzzleDetail))
+                    {
+                        if (!focused && !options.DryRun)
+                        {
+                            if (now - puzzles.OpenedAt >= TimeSpan.FromSeconds(6))
+                            {
+                                input.ReleaseAll();
+                                puzzleArchive.Handoff("게임 창이 비활성이라 자동 입력하지 못함. 판독 " + puzzleAnswer);
+                                log.Write($"[{now:hh\\:mm\\:ss}] 허풍선 입력 전에 게임 창이 비활성입니다. 직접 입력해 주세요. {puzzleAnswer}");
+                                AlertSound.Play();
+                            }
+                            else if (!puzzleFocusLogged)
+                            {
+                                puzzleFocusLogged = true;
+                                log.Write($"[{now:hh\\:mm\\:ss}] 허풍선 {puzzleAnswer} | 게임 창이 비활성이라 입력을 기다립니다. {puzzleDetail}");
+                            }
+                        }
+                        else
+                        {
+                            double readSeconds = (now - puzzles.OpenedAt).TotalSeconds;
+                            log.Write($"[{now:hh\\:mm\\:ss}] 허풍선 {puzzleArchive.EpisodeAttempt}회차 입력 {puzzleAnswer} | 판독 {readSeconds:0.0}초 | {puzzleDetail}");
+                            input.TypePuzzleAnswer(puzzleAnswer);
+                            puzzleArchive.NoteAutoTyped(puzzleAnswer, puzzleDetail);
+                            puzzleFocusLogged = false;
+                        }
+                    }
+                    else if (puzzleOpen
+                        && puzzleArchive.CanAutoType
+                        && now - puzzles.OpenedAt >= TimeSpan.FromSeconds(6))
+                    {
+                        input.ReleaseAll();
+                        puzzleArchive.Handoff("6초 안에 여섯 글자를 확정하지 못함");
+                        log.Write($"[{now:hh\\:mm\\:ss}] 허풍선 글자를 6초 안에 확정하지 못했습니다. 직접 입력해 주세요.");
+                        AlertSound.Play();
+                    }
+                    else if (!puzzleOpen)
+                    {
+                        puzzleFocusLogged = false;
+                    }
+
                     bool shouldLog = command.Reason != lastReason
                         || command.Hold != lastHold
                         || command.Tap is not null
@@ -377,7 +464,7 @@ static class LiveRunner
                     Thread.Sleep(250);
                 }
 
-                Thread.Sleep(100);
+                Thread.Sleep(puzzleBusy ? 20 : 100);
             }
         }
         finally
@@ -389,23 +476,6 @@ static class LiveRunner
 
         log.Write($"실시간 종료 | 벽돌 {counter.Consumed}개 소모 | 재구매 {counter.Refills}회");
         return 0;
-    }
-
-    private static void TryAlertBeep()
-    {
-        try
-        {
-            for (int i = 0; i < 3; i++)
-            {
-                if (OperatingSystem.IsWindows())
-                    Console.Beep(1000, 180);
-                if (i < 2)
-                    Thread.Sleep(80);
-            }
-        }
-        catch
-        {
-        }
     }
 
     private static void TryEnablePerMonitorDpiAwareness()

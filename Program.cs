@@ -66,6 +66,8 @@ for (int i = 0; i < args.Length; i++)
 
 try
 {
+    BundledFiles.Prepare();
+
     if (live)
         return LiveRunner.Run(new LiveOptions
         {

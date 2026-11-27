@@ -52,7 +52,7 @@ sealed class CharacterPuzzleReader : IDisposable
     public CharacterPuzzleReader(string fileName)
     {
         FileName = fileName;
-        string template = Path.Combine(AppContext.BaseDirectory, "Templates", "character-prompt.png");
+        string template = Path.Combine(BundledFiles.TemplateDirectory, "character-prompt.png");
         prompt = Cv2.ImDecode(File.ReadAllBytes(template), ImreadModes.Grayscale);
         if (prompt.Empty() || prompt.Width != PromptArea.Width || prompt.Height != PromptArea.Height)
         {
@@ -60,7 +60,7 @@ sealed class CharacterPuzzleReader : IDisposable
             throw new InvalidDataException("character-prompt.png 크기가 문자 문제 안내문 영역과 다릅니다.");
         }
 
-        string suffixPath = Path.Combine(AppContext.BaseDirectory, "Templates", "fail-count-suffix.png");
+        string suffixPath = Path.Combine(BundledFiles.TemplateDirectory, "fail-count-suffix.png");
         failSuffix = Cv2.ImDecode(File.ReadAllBytes(suffixPath), ImreadModes.Grayscale);
         if (failSuffix.Empty() || failSuffix.Width != 26 || failSuffix.Height != 24)
         {
@@ -69,12 +69,39 @@ sealed class CharacterPuzzleReader : IDisposable
             throw new InvalidDataException("fail-count-suffix.png 크기가 실패 횟수 /3 영역과 다릅니다.");
         }
 
-        glyphPath = Path.Combine(Directory.GetCurrentDirectory(), ".work", "ocr-live", "glyph.png");
+        glyphPath = Path.Combine(Path.GetTempPath(), "BonghwangWall", "glyph.png");
         Directory.CreateDirectory(Path.GetDirectoryName(glyphPath)!);
     }
 
     public string FileName { get; }
     public List<CharacterReading> Readings { get; } = [];
+    public bool IsOpen => open;
+    public int OpenAttempt => open ? attempt : 0;
+    public string? OpenError => open ? ocrError : null;
+    public TimeSpan OpenedAt => detectedAt;
+
+    public bool TryCurrentAnswer(TimeSpan now, out string candidate, out string detail)
+    {
+        candidate = "";
+        detail = "";
+        if (!open || ocrError is not null)
+            return false;
+
+        TimeSpan openFor = now - detectedAt;
+        bool mature = samples >= 8 || openFor >= TimeSpan.FromSeconds(4);
+        if (!mature)
+            return false;
+        if (slots.Any(slot => slot.NeedsJongSample()) && samples < 12 && openFor < TimeSpan.FromSeconds(4))
+            return false;
+
+        CharacterReading reading = BuildReading();
+        detail = reading.Detail;
+        if (reading.Candidate.Length != 6 || reading.Candidate.Contains('?'))
+            return false;
+
+        candidate = reading.Candidate;
+        return true;
+    }
 
     public void Observe(Mat frame, TimeSpan time)
     {
@@ -151,7 +178,7 @@ sealed class CharacterPuzzleReader : IDisposable
     {
         open = false;
         ClearDigit();
-        var reading = Fuse();
+        CharacterReading reading = BuildReading();
         Readings.Add(reading);
         Console.WriteLine(
             $"영상 {FileName} | 문자 허풍선 {reading.Attempt}회차 감지 {Format(reading.DetectedAt)} | 판독 구간 {Format(reading.ReadFrom)}–{Format(reading.ReadTo)}");
@@ -201,7 +228,7 @@ sealed class CharacterPuzzleReader : IDisposable
         return max;
     }
 
-    private CharacterReading Fuse()
+    private CharacterReading BuildReading()
     {
         var chars = new char[slots.Length];
         var notes = new List<string>();
@@ -557,19 +584,24 @@ sealed class CharacterPuzzleReader : IDisposable
             list.Add(value);
         }
 
+        public bool NeedsJongSample()
+        {
+            if (!TryPick(out char winner, out _) || !IsSyllable(winner))
+                return false;
+            int jong = (winner - 0xAC00) % 28;
+            if (jong != JongseongIeung && jong != JongseongMieum)
+                return false;
+            return !ratios.TryGetValue(winner, out List<double>? samples) || samples.Count < 8;
+        }
+
         public char Decide(out string note, out int margin)
         {
-            if (counts.Count == 0)
+            if (!TryPick(out char winner, out char[] ordered))
             {
                 note = "표 없음";
                 margin = 0;
                 return '?';
             }
-
-            char[] ordered = weights.Count > 0
-                ? weights.OrderByDescending(pair => pair.Value).Select(pair => pair.Key).ToArray()
-                : counts.OrderByDescending(pair => pair.Value).Select(pair => pair.Key).ToArray();
-            char winner = ordered[0];
             int votes = counts.Values.Sum();
             int winnerVotes = counts[winner];
             int runnerUpVotes = ordered.Length > 1 ? counts[ordered[1]] : 0;
@@ -608,6 +640,22 @@ sealed class CharacterPuzzleReader : IDisposable
 
             note += $" 종성유지 모서리비 p25 {lower:0.00}/p75 {upper:0.00}";
             return winner;
+        }
+
+        private bool TryPick(out char winner, out char[] ordered)
+        {
+            if (counts.Count == 0)
+            {
+                winner = '?';
+                ordered = [];
+                return false;
+            }
+
+            ordered = weights.Count > 0
+                ? weights.OrderByDescending(pair => pair.Value).Select(pair => pair.Key).ToArray()
+                : counts.OrderByDescending(pair => pair.Value).Select(pair => pair.Key).ToArray();
+            winner = ordered[0];
+            return true;
         }
 
         private static char WithJongseong(char glyph, int jong)
