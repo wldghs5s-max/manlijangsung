@@ -134,6 +134,7 @@ sealed class FieldPilot
     private int backspacesRemaining;
     private TimeSpan buySubmitAt = TimeSpan.MinValue;
     private bool buyAborted;
+    private bool quantityPromptDirty;
     private TimeSpan lastDoorStepAt = TimeSpan.MinValue;
 
     private int worldMapStep;
@@ -420,6 +421,7 @@ sealed class FieldPilot
                     backspacesRemaining = 0;
                     buySubmitAt = TimeSpan.MinValue;
                     buyAborted = false;
+                    quantityPromptDirty = false;
                     ResetStuck(view.Now);
                     return Wait("털보네대장간 도착");
                 }
@@ -433,6 +435,10 @@ sealed class FieldPilot
                         break;
                     smithWaypointIndex++;
                 }
+                if (sx >= 48 && sy >= 115 && smithWaypointIndex < SmithPath.Length - 1)
+                    smithWaypointIndex = SmithPath.Length - 1;
+                else if (sx >= 38 && sy >= 118 && smithWaypointIndex < 3)
+                    smithWaypointIndex = 3;
 
                 // 1) Directly below (1~3 tiles) or at the door threshold: dash straight Up into the door!
                 if (sx == 59 && sy is >= 120 and <= 124)
@@ -561,7 +567,7 @@ sealed class FieldPilot
                 if (view.Map != WallAtlas.Jangan || view.X is not int jx || view.Y is not int jy)
                     return Wait("장안성 북문 좌표 대기");
                 bool allowGateDash = Math.Abs(jx - JanganGate.X) + Math.Abs(jy - JanganGate.Y) > 10;
-                if (Math.Abs(jx - JanganGate.X) > 1)
+                if (Math.Abs(jx - JanganGate.X) > 1 || jy > 10)
                     return MoveTowardWithStuck(view.Map, jx, jy, JanganGate.X, Math.Min(jy, JanganGate.Y), view.Now, "장안성 북문으로 이동", blockMap: null, allowDash: allowGateDash);
                 return HoldKey(FieldKey.Up, view.Now, "장안성 북문 밖 지역 지도로 이동", allowDash: false);
         }
@@ -600,10 +606,12 @@ sealed class FieldPilot
             lastBuyDialog = view.SmithyDialog;
             buyStep = 0;
             buyStepAt = TimeSpan.MinValue;
+            bool hadPartialInput = qtyDigitsSent > 0 || purchaseSubmitted;
             qtyDigitsSent = 0;
             if (previousDialog == SmithyDialogState.QuantityPrompt && purchaseSubmitted)
             {
                 purchaseSubmitted = false;
+                quantityPromptDirty = true;
                 buyAttemptIndex++;
                 backspacesRemaining = 6;
                 if (buyAttemptIndex >= buyFallbackQuantities.Length)
@@ -612,10 +620,12 @@ sealed class FieldPilot
                     return Wait("구매 한도 도달로 대장간 이탈 준비");
                 }
             }
-            else if (view.SmithyDialog == SmithyDialogState.QuantityPrompt && buyAttemptIndex > 0)
+            else if (previousDialog == SmithyDialogState.QuantityPrompt && hadPartialInput)
             {
-                backspacesRemaining = 6;
+                quantityPromptDirty = true;
             }
+            if (view.SmithyDialog == SmithyDialogState.QuantityPrompt && (buyAttemptIndex > 0 || quantityPromptDirty))
+                backspacesRemaining = 6;
         }
 
         switch (view.SmithyDialog)
@@ -657,6 +667,8 @@ sealed class FieldPilot
                     if (buyStepAt == TimeSpan.MinValue || view.Now - buyStepAt >= TimeSpan.FromMilliseconds(80))
                     {
                         backspacesRemaining--;
+                        if (backspacesRemaining == 0)
+                            quantityPromptDirty = false;
                         buyStepAt = view.Now;
                         return new FieldCommand(null, FieldKey.Backspace, false, "구매 수량 입력칸 초기화");
                     }
@@ -671,6 +683,7 @@ sealed class FieldPilot
                     {
                         FieldKey key = ToDigitKey(digits[qtyDigitsSent]);
                         qtyDigitsSent++;
+                        quantityPromptDirty = true;
                         buyStepAt = view.Now;
                         return new FieldCommand(null, key, false, $"구매 수량 {targetQty} 입력 중");
                     }
@@ -1544,7 +1557,7 @@ sealed class FieldPilot
         }
         else if (lastMovedAt != TimeSpan.MinValue && now - lastMovedAt >= StuckThreshold)
         {
-            detourDirection = ChooseDetourDirection(map, x, y, targetX, targetY, blockMap);
+            detourDirection = ChooseDetourDirection(map, x, y, targetX, targetY, blockMap, stuckCount);
             lastMovedAt = now;
             stuckCount++;
             if (detourDirection is FieldKey nextDetour)
@@ -1651,21 +1664,22 @@ sealed class FieldPilot
         return null;
     }
 
-    private FieldKey? ChooseDetourDirection(string map, int x, int y, int targetX, int targetY, string? blockMap)
+    private FieldKey? ChooseDetourDirection(string map, int x, int y, int targetX, int targetY, string? blockMap, int attempt = 0)
     {
         int dx = Math.Sign(targetX - x);
         int dy = Math.Sign(targetY - y);
         (int X, int Y)[] candidates = Math.Abs(targetX - x) >= Math.Abs(targetY - y)
             ? [(0, dy == 0 ? 1 : dy), (0, dy == 0 ? -1 : -dy), (-dx, 0)]
             : [(dx == 0 ? 1 : dx, 0), (dx == 0 ? -1 : -dx, 0), (0, -dy)];
+        var valid = new List<FieldKey>(candidates.Length);
         foreach ((int stepX, int stepY) in candidates)
         {
             if (stepX == 0 && stepY == 0)
                 continue;
             if (ToKey(stepX, stepY) is FieldKey key && CanStep(map, x, y, key, blockMap))
-                return key;
+                valid.Add(key);
         }
-        return null;
+        return valid.Count == 0 ? null : valid[Math.Abs(attempt) % valid.Count];
     }
 
     private bool CanStep(string map, int x, int y, FieldKey key, string? blockMap)
@@ -2182,6 +2196,7 @@ static class FieldRehearsal
         CheckRepairCounterIgnoresAbsentWithoutLowStock(failures);
         CheckSmithDoorApproachDisablesDashAndAlignsPrecisely(failures);
         CheckSmithyBuyStepsDownAndClearsOnRetry(failures);
+        CheckSmithyBuyClearsAfterMidTypingFlicker(failures);
         return failures;
     }
 
@@ -3098,6 +3113,37 @@ static class FieldRehearsal
         var typedDigits = taps.Where(k => k != FieldKey.Backspace).ToArray();
         if (backspaces < 6 || typedDigits.Length < 3 || typedDigits[0] != FieldKey.Digit8 || typedDigits[1] != FieldKey.Digit0 || typedDigits[2] != FieldKey.Enter)
             failures.Add($"재시도 시 Backspace 초기화 후 80+Enter를 입력해야 합니다. backspaces={backspaces}, taps={string.Join(",", taps)}");
+    }
+
+    private static void CheckSmithyBuyClearsAfterMidTypingFlicker(List<string> failures)
+    {
+        var pilot = new FieldPilot(new Random(1));
+        var t = TimeSpan.Zero;
+        pilot.Decide(new FieldView(WallAtlas.Wall3, 16, 46, true, false, t));
+        pilot.Decide(new FieldView(WallAtlas.Wall3, 16, 46, true, false, t += TimeSpan.FromMilliseconds(250)));
+        pilot.Decide(new FieldView(WallAtlas.Guknae, 204, 108, true, false, t += TimeSpan.FromMilliseconds(250)));
+        pilot.Decide(new FieldView(WallAtlas.Guknae, 204, 108, true, false, t += TimeSpan.FromMilliseconds(250)));
+        pilot.Decide(new FieldView(WallAtlas.Guknae, 204, 108, true, false, t += TimeSpan.FromMilliseconds(200)));
+        pilot.Decide(new FieldView(WallAtlas.Guknae, 16, 108, true, false, t += TimeSpan.FromMilliseconds(200)));
+        pilot.Decide(new FieldView(WallAtlas.Smith, 5, 9, true, false, t += TimeSpan.FromMilliseconds(200)));
+
+        // Type first digit '1', then drop QuantityPrompt to None briefly (flicker), then return to QuantityPrompt.
+        FieldCommand d1 = pilot.Decide(new FieldView(WallAtlas.Smith, 5, 9, true, false, t += TimeSpan.FromMilliseconds(200), SmithyDialog: SmithyDialogState.QuantityPrompt));
+        if (d1.Tap != FieldKey.Digit1)
+            failures.Add("첫 숫자 1 입력이 나가지 않았습니다.");
+        pilot.Decide(new FieldView(WallAtlas.Smith, 5, 9, true, false, t += TimeSpan.FromMilliseconds(150), SmithyDialog: SmithyDialogState.None));
+
+        var afterFlicker = new List<FieldKey>();
+        for (int i = 0; i < 12; i++)
+        {
+            FieldCommand c = pilot.Decide(new FieldView(WallAtlas.Smith, 5, 9, true, false, t += TimeSpan.FromMilliseconds(150), SmithyDialog: SmithyDialogState.QuantityPrompt));
+            if (c.Tap is FieldKey k)
+                afterFlicker.Add(k);
+        }
+        int backspaces = afterFlicker.Count(k => k == FieldKey.Backspace);
+        var digits = afterFlicker.Where(k => k != FieldKey.Backspace).ToArray();
+        if (backspaces < 6 || digits.Length < 4 || digits[0] != FieldKey.Digit1 || digits[1] != FieldKey.Digit0 || digits[2] != FieldKey.Digit0 || digits[3] != FieldKey.Enter)
+            failures.Add($"숫자 입력 중 깜박임 발생 시 Backspace 초기화 후 100+Enter를 입력해야 합니다. backspaces={backspaces}, taps={string.Join(",", afterFlicker)}");
     }
 
     private static void CheckWallVisionDetectsLargeOverlayPopup(List<string> failures)

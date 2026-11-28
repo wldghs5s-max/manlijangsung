@@ -207,6 +207,7 @@ static class LiveRunner
         TimeSpan lastKnownAt = TimeSpan.MinValue;
         TimeSpan unknownDialogSince = TimeSpan.MinValue;
         TimeSpan overlayPopupSince = TimeSpan.MinValue;
+        TimeSpan hudLostSince = TimeSpan.MinValue;
         bool loggedCaptureSize = false;
         bool warnedFocus = false;
         bool wasInBuy = false;
@@ -270,6 +271,7 @@ static class LiveRunner
                     lastKnownAt = TimeSpan.MinValue;
                     unknownDialogSince = TimeSpan.MinValue;
                     overlayPopupSince = TimeSpan.MinValue;
+                    hudLostSince = TimeSpan.MinValue;
                     loggedCaptureSize = false;
                     warnedFocus = false;
                     puzzleFocusLogged = false;
@@ -285,6 +287,7 @@ static class LiveRunner
                     lastHold = null;
                     unknownDialogSince = TimeSpan.MinValue;
                     overlayPopupSince = TimeSpan.MinValue;
+                    hudLostSince = TimeSpan.MinValue;
                     log.Write("[일시정지] F11: 재개 | END: 종료");
                 }
 
@@ -472,6 +475,34 @@ static class LiveRunner
                     else
                     {
                         overlayPopupSince = TimeSpan.MinValue;
+                    }
+
+                    if (!worldMap
+                        && dialog == RepairDialog.None
+                        && !returnConfirm
+                        && smithyDialog == SmithyDialogState.None
+                        && !unknownDialog
+                        && !largeOverlay
+                        && !puzzleOpen
+                        && !puzzleArchive.Capturing
+                        && (map is null || x is null || y is null))
+                    {
+                        if (hudLostSince == TimeSpan.MinValue)
+                            hudLostSince = now;
+                        else if (now - hudLostSince >= TimeSpan.FromSeconds(5))
+                        {
+                            input.ReleaseAll();
+                            hotkey.ForcePause();
+                            hudLostSince = TimeSpan.MinValue;
+                            log.Write($"[{now:hh\\:mm\\:ss}] [자동 일시정지] 게임 화면/좌표 HUD가 5초 이상 사라졌습니다(연결 끊김 또는 대형 팝업 의심). 화면을 확인한 뒤 F11 키를 눌러 재개하세요.");
+                            AlertSound.Play();
+                            Thread.Sleep(100);
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        hudLostSince = TimeSpan.MinValue;
                     }
 
                     counter.Observe(screen, normalized, now);
