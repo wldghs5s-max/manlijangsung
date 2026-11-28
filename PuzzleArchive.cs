@@ -289,7 +289,7 @@ sealed class PuzzleArchive : IDisposable
             outcomeDetail,
             ledger.AutoTyped,
             PuzzleLedger.AutoTypeLimit,
-            hasVideo ? Path.Combine("허풍선기록", eventId, videoName) : "",
+            hasVideo ? Path.Combine("허풍선", eventId, videoName) : "",
             frameTimes.Count,
             frameTimes,
             ledger.Attempts.ToArray(),

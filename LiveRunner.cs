@@ -171,8 +171,9 @@ static class LiveRunner
         }
 
         TryEnablePerMonitorDpiAwareness();
+        RunData.Prepare();
 
-        using var log = new LiveLogger(Path.Combine(AppContext.BaseDirectory, "BonghwangWall.log"));
+        using var log = new LiveLogger(RunData.LogPath);
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) =>
         {
@@ -183,6 +184,7 @@ static class LiveRunner
         using var screen = new RepairScreen();
         using var hud = new HudReader();
         using var puzzles = new CharacterPuzzleReader("live");
+        using var squirrels = new SquirrelTracker();
         var vision = new WallVision();
         var counter = new RepairCounter(options.PurchaseQuantity);
         var pilot = new FieldPilot(new Random(), hud.SupportedWalls, options.PurchaseQuantity);
@@ -212,16 +214,21 @@ static class LiveRunner
         bool warnedFocus = false;
         bool wasInBuy = false;
         bool puzzleFocusLogged = false;
-        using var puzzleArchive = new PuzzleArchive(Path.Combine(AppContext.BaseDirectory, "허풍선기록"));
+        bool puzzleRepairLogged = false;
+        TimeSpan puzzleRepairHold = TimeSpan.Zero;
+        TimeSpan puzzleRepairSince = TimeSpan.MinValue;
+        using var puzzleArchive = new PuzzleArchive(RunData.PuzzleRoot);
 
         log.Write("==================================================");
         log.Write("  봉황 만리장성 자동 진행");
         log.Write($"  모드: {(options.DryRun ? "드라이런(입력 안 함)" : "실제 입력")} | 벽돌 구매 단위: {options.PurchaseQuantity}개");
+        log.Write($"  기록 폴더: {RunData.Root}");
         log.Write($"  로그 파일: {log.LogPath}");
         log.Write("  F11 : 시작 / 일시정지");
         log.Write("  END : 즉시 종료");
         log.Write("  허풍선 자동 입력은 2회까지입니다. 두 번 실패하면 알림 후 일시정지합니다.");
-        log.Write("  허풍선 영상과 결과는 exe 옆 허풍선기록 폴더에 남깁니다.");
+        log.Write("  다람쥐 야바위가 나오면 도토리 다람쥐를 따라가다가 멈추면 클릭합니다.");
+        log.Write("  로그와 허풍선 영상은 exe 옆 봉황기록 폴더에 쌓입니다. 폴더를 통째로 보내면 됩니다.");
         log.Write("==================================================");
         log.Write(MotherboardBeep.Probe());
         log.Write(AlertSound.EnableLoudOutput());
@@ -348,9 +355,17 @@ static class LiveRunner
                         : SmithyDialogState.None;
 
                     puzzles.Observe(normalized, now);
+                    squirrels.Observe(normalized, now);
                     bool puzzleOpen = puzzles.IsOpen;
+                    bool squirrelOpen = squirrels.IsOpen;
+                    if (squirrels.JustOpened)
+                    {
+                        input?.ReleaseAll();
+                        log.Write($"[{now:hh\\:mm\\:ss}] 다람쥐 야바위 감지. 도토리를 든 다람쥐를 따라갑니다.");
+                        AlertSound.Play();
+                    }
                     string? puzzleRecord = puzzleArchive.Observe(normalized, now, puzzleOpen, puzzles.OpenAttempt, puzzles.Readings);
-                    puzzleBusy = puzzleOpen || puzzleArchive.Capturing;
+                    puzzleBusy = puzzleOpen || squirrelOpen || puzzleArchive.Capturing;
                     if (puzzleRecord is { Length: > 0 })
                         log.Write($"[{now:hh\\:mm\\:ss}] {puzzleRecord}");
                     if (puzzleArchive.JustOpened)
@@ -380,6 +395,7 @@ static class LiveRunner
                     }
 
                     bool unknownDialog = !puzzleOpen
+                        && !squirrelOpen
                         && !worldMap
                         && dialog == RepairDialog.None
                         && !returnConfirm
@@ -407,7 +423,7 @@ static class LiveRunner
                         unknownDialogSince = TimeSpan.MinValue;
                     }
 
-                    if (worldMap || dialog != RepairDialog.None || returnConfirm || smithyDialog != SmithyDialogState.None || unknownDialog || puzzleOpen || puzzleArchive.Capturing)
+                    if (worldMap || dialog != RepairDialog.None || returnConfirm || smithyDialog != SmithyDialogState.None || unknownDialog || puzzleOpen || squirrelOpen || puzzleArchive.Capturing)
                     {
                         lastKnownMap = null;
                         lastKnownX = null;
@@ -440,6 +456,7 @@ static class LiveRunner
                         && !returnConfirm
                         && !unknownDialog
                         && !puzzleOpen
+                        && !squirrelOpen
                         && !puzzleArchive.Capturing)
                     {
                         List<TileScan> scans = vision.Scan(normalized, map, px, py);
@@ -484,6 +501,7 @@ static class LiveRunner
                         && !unknownDialog
                         && !largeOverlay
                         && !puzzleOpen
+                        && !squirrelOpen
                         && !puzzleArchive.Capturing
                         && (map is null || x is null || y is null))
                     {
@@ -506,7 +524,7 @@ static class LiveRunner
                     }
 
                     counter.Observe(screen, normalized, now);
-                    if (map is not null && !worldMap && dialog == RepairDialog.None && !returnConfirm && !unknownDialog && !largeOverlay && !puzzleOpen && !puzzleArchive.Capturing)
+                    if (map is not null && !worldMap && dialog == RepairDialog.None && !returnConfirm && !unknownDialog && !largeOverlay && !puzzleOpen && !squirrelOpen && !puzzleArchive.Capturing)
                         counter.ObserveStock(stock, now, allowAutoCancel: !pilot.IsSupplying || !pilot.InBuyPhase);
 
                     var view = new FieldView(
@@ -521,9 +539,17 @@ static class LiveRunner
                         SmithyDialog: smithyDialog,
                         Stock: stock,
                         ReturnConfirmOpen: returnConfirm,
-                        PuzzleOpen: puzzleOpen || puzzleArchive.Capturing);
+                        PuzzleOpen: puzzleOpen || squirrelOpen || puzzleArchive.Capturing);
 
                     FieldCommand command = pilot.Decide(view);
+                    if (pilot.PurchaseNeedsUser)
+                    {
+                        input?.ReleaseAll();
+                        hotkey.ForcePause();
+                        log.Write($"[{now:hh\\:mm\\:ss}] [일시정지] 벽돌 수량이 입력되지 않았습니다. 수량 칸에 100을 직접 입력한 뒤 F11로 재개하세요.");
+                        AlertSound.Play();
+                        continue;
+                    }
                     if (wasInBuy && !pilot.InBuyPhase)
                         counter.MarkSupplied();
                     wasInBuy = pilot.InBuyPhase;
@@ -540,13 +566,51 @@ static class LiveRunner
                     }
 
                     input.Apply(command);
+                    bool repairBlocksPuzzle = dialog != RepairDialog.None;
+                    if (!puzzleOpen)
+                    {
+                        puzzleRepairHold = TimeSpan.Zero;
+                        puzzleRepairSince = TimeSpan.MinValue;
+                        puzzleRepairLogged = false;
+                    }
+                    else if (repairBlocksPuzzle)
+                    {
+                        if (puzzleRepairSince == TimeSpan.MinValue)
+                            puzzleRepairSince = now;
+                        if (!puzzleRepairLogged)
+                        {
+                            puzzleRepairLogged = true;
+                            log.Write($"[{now:hh\\:mm\\:ss}] 허풍선 중 수리 창이 열려 수리를 먼저 넘깁니다.");
+                        }
+                    }
+                    else if (puzzleRepairSince != TimeSpan.MinValue)
+                    {
+                        puzzleRepairHold += now - puzzleRepairSince;
+                        puzzleRepairSince = TimeSpan.MinValue;
+                        puzzleRepairLogged = false;
+                    }
+                    TimeSpan puzzleAge = now - puzzles.OpenedAt - puzzleRepairHold;
+                    if (puzzleRepairSince != TimeSpan.MinValue)
+                        puzzleAge -= now - puzzleRepairSince;
+
+                    if (input is not null
+                        && !repairBlocksPuzzle
+                        && squirrels.TryGetClick(out int squirrelX, out int squirrelY, out string squirrelDetail)
+                        && (focused || options.DryRun))
+                    {
+                        log.Write($"[{now:hh\\:mm\\:ss}] 다람쥐 야바위 클릭 ({squirrelX},{squirrelY}) | {squirrelDetail}");
+                        input.ClickScreen(squirrelX, squirrelY);
+                        squirrels.ConfirmClick();
+                        SaveSquirrelSample(normalized, squirrelX, squirrelY, squirrelDetail);
+                    }
                     if (puzzleOpen
+                        && !repairBlocksPuzzle
                         && puzzleArchive.CanAutoType
                         && puzzles.TryCurrentAnswer(now, out string puzzleAnswer, out string puzzleDetail))
                     {
                         if (!focused && !options.DryRun)
                         {
-                            if (now - puzzles.OpenedAt >= TimeSpan.FromSeconds(6))
+                            if (puzzleAge >= TimeSpan.FromSeconds(8))
                             {
                                 input.ReleaseAll();
                                 puzzleArchive.Handoff("게임 창이 비활성이라 자동 입력하지 못함. 판독 " + puzzleAnswer);
@@ -561,7 +625,7 @@ static class LiveRunner
                         }
                         else
                         {
-                            double readSeconds = (now - puzzles.OpenedAt).TotalSeconds;
+                            double readSeconds = puzzleAge.TotalSeconds;
                             log.Write($"[{now:hh\\:mm\\:ss}] 허풍선 {puzzleArchive.EpisodeAttempt}회차 입력 {puzzleAnswer} | 판독 {readSeconds:0.0}초 | {puzzleDetail}");
                             input.TypePuzzleAnswer(puzzleAnswer);
                             puzzleArchive.NoteAutoTyped(puzzleAnswer, puzzleDetail);
@@ -569,12 +633,13 @@ static class LiveRunner
                         }
                     }
                     else if (puzzleOpen
+                        && !repairBlocksPuzzle
                         && puzzleArchive.CanAutoType
-                        && now - puzzles.OpenedAt >= TimeSpan.FromSeconds(6))
+                        && puzzleAge >= TimeSpan.FromSeconds(8))
                     {
                         input.ReleaseAll();
-                        puzzleArchive.Handoff("6초 안에 여섯 글자를 확정하지 못함");
-                        log.Write($"[{now:hh\\:mm\\:ss}] 허풍선 글자를 6초 안에 확정하지 못했습니다. 직접 입력해 주세요.");
+                        puzzleArchive.Handoff("8초 안에 글자가 멈추고 확정되지 않음");
+                        log.Write($"[{now:hh\\:mm\\:ss}] 허풍선 글자가 읽힐 만큼 멈추지 않았습니다. 직접 입력해 주세요.");
                         AlertSound.Play();
                     }
                     else if (!puzzleOpen)
@@ -716,6 +781,25 @@ static class LiveRunner
         if (!ClientToScreen(hWnd, ref origin))
             return $"{rect.Right - rect.Left}x{rect.Bottom - rect.Top}";
         return $"({origin.X},{origin.Y}) {rect.Right - rect.Left}x{rect.Bottom - rect.Top}";
+    }
+
+    private static void SaveSquirrelSample(Mat frame, int x, int y, string detail)
+    {
+        try
+        {
+            string dir = Path.Combine(RunData.Root, "다람쥐");
+            Directory.CreateDirectory(dir);
+            string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            string json = Path.Combine(dir, stamp + ".json");
+            string jpg = Path.Combine(dir, stamp + ".jpg");
+            if (!Cv2.ImEncode(".jpg", frame, out byte[] encoded))
+                return;
+            File.WriteAllBytes(jpg, encoded);
+            File.WriteAllText(json, "{\"시각\":\"" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "\",\"클릭X\":" + x + ",\"클릭Y\":" + y + ",\"설명\":\"" + detail.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\",\"화면\":\"" + Path.GetFileName(jpg) + "\"}" + Environment.NewLine);
+        }
+        catch
+        {
+        }
     }
 
     private sealed class LiveLogger : IDisposable

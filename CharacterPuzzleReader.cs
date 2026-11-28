@@ -35,6 +35,8 @@ sealed class CharacterPuzzleReader : IDisposable
     private readonly Mat score = new();
     private readonly string glyphPath;
     private Mat? failDigit;
+    private Mat? lastGlyph;
+    private int settledRun;
     private IGlyphSession? session;
     private string? ocrError;
     private int readFailures;
@@ -87,11 +89,9 @@ sealed class CharacterPuzzleReader : IDisposable
         if (!open || ocrError is not null)
             return false;
 
-        TimeSpan openFor = now - detectedAt;
-        bool mature = samples >= 8 || openFor >= TimeSpan.FromSeconds(4);
-        if (!mature)
+        if (samples < 4 || slots.Any(slot => !slot.IsConfident()))
             return false;
-        if (slots.Any(slot => slot.NeedsJongSample()) && samples < 12 && openFor < TimeSpan.FromSeconds(4))
+        if (slots.Any(slot => slot.NeedsJongSample()) && samples < 8)
             return false;
 
         CharacterReading reading = BuildReading();
@@ -126,8 +126,10 @@ sealed class CharacterPuzzleReader : IDisposable
             lastSeen = time;
             if (state == DigitWatch.Stable && time - lastSample >= SampleGap)
             {
-                ReadGlyphs(frame);
                 lastSample = time;
+                if (!GlyphSettled(frame))
+                    return;
+                ReadGlyphs(frame);
                 readTo = time;
                 samples++;
             }
@@ -147,6 +149,7 @@ sealed class CharacterPuzzleReader : IDisposable
     public void Dispose()
     {
         session?.Dispose();
+        lastGlyph?.Dispose();
         prompt.Dispose();
         failSuffix.Dispose();
         failDigit?.Dispose();
@@ -164,6 +167,9 @@ sealed class CharacterPuzzleReader : IDisposable
         lastSample = time - SampleGap;
         samples = 0;
         slots = NewSlots();
+        settledRun = 0;
+        lastGlyph?.Dispose();
+        lastGlyph = null;
         ocrError = null;
         readFailures = 0;
         ClearDigit();
@@ -245,6 +251,34 @@ sealed class CharacterPuzzleReader : IDisposable
         if (ocrError is not null)
             detail += $" | 인식 오류 {ocrError}";
         return new CharacterReading(FileName, attempt, detectedAt, readFrom, readTo, new string(chars), detail);
+    }
+
+    private bool GlyphSettled(Mat frame)
+    {
+        using var region = new Mat(frame, GlyphArea);
+        using var current = new Mat();
+        Cv2.CvtColor(region, current, ColorConversionCodes.BGR2GRAY);
+        if (lastGlyph is null || lastGlyph.Width != current.Width || lastGlyph.Height != current.Height)
+        {
+            lastGlyph?.Dispose();
+            lastGlyph = current.Clone();
+            settledRun = 0;
+            return false;
+        }
+
+        using var diff = new Mat();
+        Cv2.Absdiff(current, lastGlyph, diff);
+        double mean = Cv2.Mean(diff).Val0;
+        lastGlyph.Dispose();
+        lastGlyph = current.Clone();
+        if (mean > 8.5)
+        {
+            settledRun = 0;
+            return false;
+        }
+
+        settledRun++;
+        return settledRun >= 2;
     }
 
     private void ReadGlyphs(Mat frame)
@@ -582,6 +616,15 @@ sealed class CharacterPuzzleReader : IDisposable
             if (!ratios.TryGetValue(glyph, out List<double>? list))
                 ratios[glyph] = list = [];
             list.Add(value);
+        }
+
+        public bool IsConfident()
+        {
+            if (!TryPick(out char winner, out char[] ordered) || !IsSyllable(winner))
+                return false;
+            int winnerVotes = counts[winner];
+            int runnerUpVotes = ordered.Length > 1 ? counts[ordered[1]] : 0;
+            return winnerVotes >= 3 && winnerVotes - runnerUpVotes >= 2;
         }
 
         public bool NeedsJongSample()
