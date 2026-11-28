@@ -17,10 +17,20 @@ sealed class WallVision
     private readonly byte[] frameBytes = new byte[FrameWidth * FrameHeight * 3];
 
     public string LastSkipReason { get; private set; } = "";
+    public int LastEligibleCount { get; private set; }
+    public int LastUnclassifiedCount { get; private set; }
+    public double LastCenterUnclassifiedRatio { get; private set; }
+    public bool HasLargeOverlay { get; private set; }
+    public string LastOverlayReason { get; private set; } = "";
 
     public List<TileScan> Scan(Mat frame, string map, int playerX, int playerY)
     {
         LastSkipReason = "";
+        LastEligibleCount = 0;
+        LastUnclassifiedCount = 0;
+        LastCenterUnclassifiedRatio = 0;
+        HasLargeOverlay = false;
+        LastOverlayReason = "";
         var results = new List<TileScan>();
         if (frame.Width != FrameWidth || frame.Height != FrameHeight || frame.Type() != MatType.CV_8UC3)
             return results;
@@ -59,6 +69,13 @@ sealed class WallVision
         int brownTileCount = 0;
         int brownCenterCount = 0;
         int centerTotal = 0;
+        int eligibleTiles = 0;
+        int unclassifiedTiles = 0;
+        int centerEligible = 0;
+        int centerUnclassified = 0;
+        int centerDark = 0;
+        int outerEligible = 0;
+        int outerDark = 0;
         long sumR = 0;
         long sumG = 0;
         long sumB = 0;
@@ -88,6 +105,13 @@ sealed class WallVision
                 if (x1 > 1230 && y0 < 255)
                     continue; // 우측 상단 미니맵
 
+                bool inCenter = cx is >= 280 and <= 1220 && cy is >= 120 and <= 780;
+                eligibleTiles++;
+                if (inCenter)
+                    centerEligible++;
+                else
+                    outerEligible++;
+
                 if (TryClassifyPatch(
                     x0, y0, x1, y1, abovePlayer,
                     out bool walkable, out bool isStatic, out bool isDark, out bool isGrass, out bool isBrown, out bool isFlag,
@@ -99,7 +123,13 @@ sealed class WallVision
                     else
                     {
                         if (isDark)
+                        {
                             darkTileCount++;
+                            if (inCenter)
+                                centerDark++;
+                            else
+                                outerDark++;
+                        }
                         if (isGrass)
                             grassTileCount++;
                         if (isBrown)
@@ -118,13 +148,52 @@ sealed class WallVision
                     sumB += avgB;
                     sampleTiles++;
                 }
+                else
+                {
+                    unclassifiedTiles++;
+                    if (inCenter)
+                        centerUnclassified++;
+                }
             }
         }
+
+        bool isDarkTransition = eligibleTiles > 0 && darkTileCount > eligibleTiles * 0.55;
+        double unclassifiedRatio = eligibleTiles > 0 ? (double)unclassifiedTiles / eligibleTiles : 0;
+        double centerUnclassifiedRatio = centerEligible > 0 ? (double)centerUnclassified / centerEligible : 0;
+        double centerDarkRatio = centerEligible > 0 ? (double)centerDark / centerEligible : 0;
+        double outerDarkRatio = outerEligible > 0 ? (double)outerDark / outerEligible : 0;
+
+        LastEligibleCount = eligibleTiles;
+        LastUnclassifiedCount = unclassifiedTiles;
+        LastCenterUnclassifiedRatio = centerUnclassifiedRatio;
 
         string avgRgb = sampleTiles > 0 ? $"{sumR / sampleTiles},{sumG / sampleTiles},{sumB / sampleTiles}" : "-";
         if (results.Count > 0 && darkTileCount > results.Count * 0.65)
         {
             LastSkipReason = $"암전({darkTileCount}/{results.Count})";
+            return [];
+        }
+        if (!isDarkTransition)
+        {
+            if (eligibleTiles >= 200 && unclassifiedTiles >= 65 && unclassifiedRatio >= 0.21)
+            {
+                HasLargeOverlay = true;
+                LastOverlayReason = $"미분류UI({unclassifiedTiles}/{eligibleTiles},{unclassifiedRatio:P0})";
+            }
+            else if (centerEligible >= 100 && centerUnclassified >= 48 && centerUnclassifiedRatio >= 0.28)
+            {
+                HasLargeOverlay = true;
+                LastOverlayReason = $"중앙팝업UI({centerUnclassified}/{centerEligible},{centerUnclassifiedRatio:P0})";
+            }
+            else if (centerEligible >= 100 && outerEligible >= 40 && centerDark >= 48 && centerDarkRatio >= 0.28 && outerDarkRatio <= 0.20)
+            {
+                HasLargeOverlay = true;
+                LastOverlayReason = $"중앙암부팝업({centerDark}/{centerEligible},외곽:{outerDark}/{outerEligible})";
+            }
+        }
+        if (HasLargeOverlay)
+        {
+            LastSkipReason = $"팝업가림({LastOverlayReason})";
             return [];
         }
         if (centerTotal >= 12 && brownCenterCount > centerTotal * 0.60)
@@ -218,7 +287,7 @@ sealed class WallVision
                     flagBlue++;
                     continue;
                 }
-                if (r > b + 40 && r > g + 35 && r > 115)
+                if (r > b + 50 && r > g + 40 && r > 120 && g < 115)
                 {
                     flagRed++;
                     continue;

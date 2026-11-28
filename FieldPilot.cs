@@ -14,6 +14,7 @@ enum FieldKey
     Dash,
     Enter,
     Escape,
+    Backspace,
     Digit0,
     Digit1,
     Digit2,
@@ -62,18 +63,18 @@ sealed class FieldPilot
     private static readonly TimeSpan ShortBlockTtl = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan LongBlockTtl = TimeSpan.FromSeconds(300);
     private static readonly TimeSpan UnreachableTargetTtl = TimeSpan.FromSeconds(180);
-    private static readonly TimeSpan CellFreshWindow = TimeSpan.FromSeconds(90);
-    private static readonly TimeSpan MaxWallSweepTime = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan CellFreshWindow = TimeSpan.FromMinutes(6);
+    private static readonly TimeSpan MaxWallSweepTime = TimeSpan.FromSeconds(65);
     private const int CellSize = 4;
-    private const int TargetFreshCellsPerVisit = 14;
+    private const int TargetFreshCellsPerVisit = 48;
 
     private static readonly (int X, int Y)[] SmithPath =
     [
         (16, 108),
         (40, 108),
-        (40, 121),
-        (53, 122),
-        (59, 121)
+        (40, 122),
+        (53, 123),
+        (59, 123)
     ];
 
     private static readonly (int X, int Y) JanganGate = (115, 7);
@@ -95,6 +96,8 @@ sealed class FieldPilot
     private readonly Dictionary<(string Map, int X, int Y), TimeSpan> visualBlocked = new();
     private readonly HashSet<(string Map, int X, int Y)> visualStaticBlocks = new();
     private readonly Dictionary<(string Map, int X, int Y), int> visualWalkableStreak = new();
+    private readonly Dictionary<string, TimeSpan> lastVisualClearAt = new();
+    private readonly Dictionary<string, TimeSpan> visualSuppressUntil = new();
 
     private string? waypointMap;
     private int waypointX;
@@ -106,6 +109,7 @@ sealed class FieldPilot
     private TimeSpan wallEnteredAt = TimeSpan.MinValue;
     private int freshCellsOnWall;
     private FieldKey? lastHeldDirection;
+    private TimeSpan lastDirectionChangeAt = TimeSpan.MinValue;
     private FieldKey? lastBlockedDir;
     private FieldKey? escapeDirection;
     private TimeSpan escapeUntil = TimeSpan.MinValue;
@@ -125,6 +129,12 @@ sealed class FieldPilot
     private SmithyDialogState lastBuyDialog;
     private int qtyDigitsSent;
     private bool purchaseSubmitted;
+    private readonly int[] buyFallbackQuantities;
+    private int buyAttemptIndex;
+    private int backspacesRemaining;
+    private TimeSpan buySubmitAt = TimeSpan.MinValue;
+    private bool buyAborted;
+    private TimeSpan lastDoorStepAt = TimeSpan.MinValue;
 
     private int worldMapStep;
     private TimeSpan worldMapAt = TimeSpan.MinValue;
@@ -144,6 +154,19 @@ sealed class FieldPilot
     {
         this.random = random;
         this.purchaseQuantity = Math.Max(1, purchaseQuantity);
+        buyFallbackQuantities = new[]
+        {
+            this.purchaseQuantity,
+            (int)(this.purchaseQuantity * 0.8),
+            (int)(this.purchaseQuantity * 0.5),
+            20,
+            10
+        }
+        .Where(q => q > 0 && q <= this.purchaseQuantity)
+        .Distinct()
+        .ToArray();
+        if (buyFallbackQuantities.Length == 0)
+            buyFallbackQuantities = [this.purchaseQuantity];
         if (allowedWalls is { Count: > 0 })
         {
             var filtered = allowedWalls
@@ -234,6 +257,8 @@ sealed class FieldPilot
 
             if (WallAtlas.WallPort(map, scan.X, scan.Y) is not null)
                 continue;
+            if (visualSuppressUntil.TryGetValue(map, out TimeSpan suppressUntil) && now < suppressUntil)
+                continue;
 
             visualWalkableStreak.Remove(key);
             if (scan.IsStaticTerrain)
@@ -253,7 +278,11 @@ sealed class FieldPilot
     public FieldCommand Decide(FieldView view)
     {
         FieldCommand command = DecideCore(view);
-        lastHeldDirection = command.Hold;
+        if (command.Hold != lastHeldDirection)
+        {
+            lastHeldDirection = command.Hold;
+            lastDirectionChangeAt = view.Now;
+        }
         return command;
     }
 
@@ -387,6 +416,10 @@ sealed class FieldPilot
                     lastBuyDialog = SmithyDialogState.None;
                     qtyDigitsSent = 0;
                     purchaseSubmitted = false;
+                    buyAttemptIndex = 0;
+                    backspacesRemaining = 0;
+                    buySubmitAt = TimeSpan.MinValue;
+                    buyAborted = false;
                     ResetStuck(view.Now);
                     return Wait("털보네대장간 도착");
                 }
@@ -401,11 +434,45 @@ sealed class FieldPilot
                     smithWaypointIndex++;
                 }
 
-                (int tx, int ty) = SmithPath[smithWaypointIndex];
-                if (smithWaypointIndex == SmithPath.Length - 1 && sx == tx && sy is <= 122 and >= 120)
-                    return HoldKey(FieldKey.Up, view.Now, "털보네대장간 문으로 입장");
+                // 1) Directly below (1~3 tiles) or at the door threshold: dash straight Up into the door!
+                if (sx == 59 && sy is >= 120 and <= 124)
+                    return HoldKey(FieldKey.Up, view.Now, "털보네대장간 문으로 풍신보 입장", allowDash: true);
 
-                return MoveTowardWithStuck(view.Map, sx, sy, tx, ty, view.Now, "털보네대장간으로 다리를 건너 이동", blockMap: null);
+                // 2) Never walk horizontally along the solid building wall line (y <= 121) near the smithy.
+                //    Drop down onto the open street (y = 122..124) first using MoveTowardWithStuck so any NPC obstacle still detours cleanly.
+                if (sx is >= 50 and <= 66 && sy <= 121 && sx != 59)
+                    return MoveTowardWithStuck(view.Map, sx, sy, sx, 123, view.Now, "대장간 건물 벽에서 아래쪽 도로로 이동", blockMap: null, allowDash: false);
+
+                (int tx, int ty) = SmithPath[smithWaypointIndex];
+                int doorDist = Math.Abs(sx - 59) + Math.Abs(sy - 123);
+                bool allowSmithDash = doorDist > 8;
+                if (smithWaypointIndex == SmithPath.Length - 1
+                    && sy is >= 122 and <= 124
+                    && Math.Abs(sx - 59) <= 4
+                    && sx != 59)
+                {
+                    if (lastMap != view.Map || lastX != sx || lastY != sy)
+                    {
+                        lastMap = view.Map;
+                        lastX = sx;
+                        lastY = sy;
+                        lastMovedAt = view.Now;
+                    }
+                    else if (lastMovedAt != TimeSpan.MinValue && view.Now - lastMovedAt >= TimeSpan.FromMilliseconds(1200))
+                    {
+                        return MoveTowardWithStuck(view.Map, sx, sy, 59, sy == 122 ? 123 : 124, view.Now, "대장간 입구 아래 우회 정렬", blockMap: null, allowDash: false);
+                    }
+
+                    if (lastDoorStepAt == TimeSpan.MinValue || view.Now - lastDoorStepAt >= TimeSpan.FromMilliseconds(180))
+                    {
+                        lastDoorStepAt = view.Now;
+                        FieldKey stepKey = sx < 59 ? FieldKey.Right : FieldKey.Left;
+                        return new FieldCommand(null, stepKey, false, "털보네대장간 입구 아래 정밀 정렬");
+                    }
+                    return Wait("털보네대장간 입구 정렬 대기");
+                }
+
+                return MoveTowardWithStuck(view.Map, sx, sy, tx, ty, view.Now, "털보네대장간 입구 아래로 이동", blockMap: null, allowDash: allowSmithDash);
 
             case SupplyPhase.Buy:
                 if (view.Map == WallAtlas.Guknae)
@@ -493,9 +560,10 @@ sealed class FieldPilot
                 worldMapStep = 0;
                 if (view.Map != WallAtlas.Jangan || view.X is not int jx || view.Y is not int jy)
                     return Wait("장안성 북문 좌표 대기");
+                bool allowGateDash = Math.Abs(jx - JanganGate.X) + Math.Abs(jy - JanganGate.Y) > 10;
                 if (Math.Abs(jx - JanganGate.X) > 1)
-                    return MoveTowardWithStuck(view.Map, jx, jy, JanganGate.X, Math.Min(jy, JanganGate.Y), view.Now, "장안성 북문으로 이동", blockMap: null);
-                return HoldKey(FieldKey.Up, view.Now, "장안성 북문 밖 지역 지도로 이동");
+                    return MoveTowardWithStuck(view.Map, jx, jy, JanganGate.X, Math.Min(jy, JanganGate.Y), view.Now, "장안성 북문으로 이동", blockMap: null, allowDash: allowGateDash);
+                return HoldKey(FieldKey.Up, view.Now, "장안성 북문 밖 지역 지도로 이동", allowDash: false);
         }
 
         return Supply(view);
@@ -503,7 +571,7 @@ sealed class FieldPilot
 
     private FieldCommand DecideSmithyBuy(FieldView view)
     {
-        bool hasBricks = !view.NeedsBricks || (purchaseSubmitted && view.Stock is BrickStock.QuantityVisible or BrickStock.Two or BrickStock.One);
+        bool hasBricks = buyAborted || !view.NeedsBricks || (purchaseSubmitted && view.Stock is BrickStock.QuantityVisible or BrickStock.Two or BrickStock.One);
         if (hasBricks)
         {
             if (view.SmithyDialog != SmithyDialogState.None)
@@ -515,15 +583,39 @@ sealed class FieldPilot
                 }
                 return Wait("상점 대화창 종료 대기");
             }
-            return HoldKey(FieldKey.Down, view.Now, "벽돌 구매 후 대장간 밖으로 이동");
+            return HoldKey(FieldKey.Down, view.Now, "벽돌 구매 후 대장간 밖으로 이동", allowDash: false);
+        }
+
+        if (purchaseSubmitted
+            && view.SmithyDialog == SmithyDialogState.None
+            && buySubmitAt != TimeSpan.MinValue
+            && view.Now - buySubmitAt < TimeSpan.FromMilliseconds(1500))
+        {
+            return Wait("구매 결과 확인 대기");
         }
 
         if (view.SmithyDialog != lastBuyDialog)
         {
+            SmithyDialogState previousDialog = lastBuyDialog;
             lastBuyDialog = view.SmithyDialog;
             buyStep = 0;
             buyStepAt = TimeSpan.MinValue;
             qtyDigitsSent = 0;
+            if (previousDialog == SmithyDialogState.QuantityPrompt && purchaseSubmitted)
+            {
+                purchaseSubmitted = false;
+                buyAttemptIndex++;
+                backspacesRemaining = 6;
+                if (buyAttemptIndex >= buyFallbackQuantities.Length)
+                {
+                    buyAborted = true;
+                    return Wait("구매 한도 도달로 대장간 이탈 준비");
+                }
+            }
+            else if (view.SmithyDialog == SmithyDialogState.QuantityPrompt && buyAttemptIndex > 0)
+            {
+                backspacesRemaining = 6;
+            }
         }
 
         switch (view.SmithyDialog)
@@ -560,7 +652,19 @@ sealed class FieldPilot
                 return Wait("수량 입력창 대기");
 
             case SmithyDialogState.QuantityPrompt:
-                string digits = purchaseQuantity.ToString();
+                if (backspacesRemaining > 0)
+                {
+                    if (buyStepAt == TimeSpan.MinValue || view.Now - buyStepAt >= TimeSpan.FromMilliseconds(80))
+                    {
+                        backspacesRemaining--;
+                        buyStepAt = view.Now;
+                        return new FieldCommand(null, FieldKey.Backspace, false, "구매 수량 입력칸 초기화");
+                    }
+                    return Wait("구매 수량 입력칸 초기화 대기");
+                }
+
+                int targetQty = buyFallbackQuantities[Math.Min(buyAttemptIndex, buyFallbackQuantities.Length - 1)];
+                string digits = targetQty.ToString();
                 if (qtyDigitsSent < digits.Length)
                 {
                     if (buyStepAt == TimeSpan.MinValue || view.Now - buyStepAt >= TimeSpan.FromMilliseconds(120))
@@ -568,22 +672,30 @@ sealed class FieldPilot
                         FieldKey key = ToDigitKey(digits[qtyDigitsSent]);
                         qtyDigitsSent++;
                         buyStepAt = view.Now;
-                        return new FieldCommand(null, key, false, $"구매 수량 {purchaseQuantity} 입력 중");
+                        return new FieldCommand(null, key, false, $"구매 수량 {targetQty} 입력 중");
                     }
                     return Wait("구매 수량 숫자 입력 대기");
                 }
                 if (!purchaseSubmitted && view.Now - buyStepAt >= TimeSpan.FromMilliseconds(120))
                 {
                     purchaseSubmitted = true;
+                    buySubmitAt = view.Now;
                     buyStepAt = view.Now;
-                    return new FieldCommand(null, FieldKey.Enter, false, $"벽돌 {purchaseQuantity}개 구매 확정");
+                    return new FieldCommand(null, FieldKey.Enter, false, $"벽돌 {targetQty}개 구매 확정");
                 }
                 if (purchaseSubmitted && view.Now - buyStepAt >= TimeSpan.FromSeconds(2))
                 {
+                    buyAttemptIndex++;
+                    if (buyAttemptIndex >= buyFallbackQuantities.Length)
+                    {
+                        buyAborted = true;
+                        return Wait("구매 한도 도달로 대장간 이탈 준비");
+                    }
                     qtyDigitsSent = 0;
                     purchaseSubmitted = false;
+                    backspacesRemaining = 6;
                     buyStepAt = TimeSpan.MinValue;
-                    return Wait("구매가 확정되지 않아 수량 재입력");
+                    return Wait($"구매가 확정되지 않아 {buyFallbackQuantities[buyAttemptIndex]}개로 재입력");
                 }
                 return Wait("벽돌 구매 완료 대기");
 
@@ -649,12 +761,13 @@ sealed class FieldPilot
 
         DetectWallStuck(map, x, y, now);
         RecordVisit(map, x, y, now);
+        bool safeDash = !WallAtlas.IsNearWorldExit(map, x, y, 12, allowedWalls);
 
         if (WallAtlas.IsForbiddenPatrolTile(map, x, y, allowedWalls) && WallAtlas.WallPort(map, x, y) is null)
         {
             waypointMap = null;
             escapeDirection = null;
-            return HoldAway(map, x, y, now, "성문이나 성벽 외곽 안전 구역에서 안쪽으로 이동");
+            return HoldAway(map, x, y, now, "성문이나 성벽 외곽 안전 구역에서 안쪽으로 이동", allowDash: false);
         }
 
         if (escapeDirection is FieldKey escKey && now < escapeUntil)
@@ -668,7 +781,7 @@ sealed class FieldPilot
                 || IsBlocked(map, nx, ny, now)
                 || WallAtlas.IsForbiddenPatrolTile(map, nx, ny, allowedWalls);
             if (!escaped && !invalidNext)
-                return HoldKey(escKey, now, $"{map} 깃발·벽 구간 수직 탈출");
+                return HoldKey(escKey, now, $"{map} 깃발·벽 구간 수직 탈출", allowDash: safeDash);
 
             escapeDirection = null;
             escapeUntil = TimeSpan.MinValue;
@@ -682,17 +795,18 @@ sealed class FieldPilot
             PickNextSweepWall(map);
         }
 
-        if (!HasWaypoint(map, x, y))
+        if (!HasWaypoint(map, x, y, now))
             ChooseUnvisitedWaypoint(map, x, y, now);
 
         if (waypointMap != map)
         {
+            visualSuppressUntil.Remove(map);
             MapPort hop = WallAtlas.Hop(map, waypointMap!);
             if (x == hop.X && y == hop.Y)
             {
                 FieldKey? outward = WallAtlas.OutwardDirection(map, hop);
                 return outward is FieldKey key
-                    ? HoldKey(key, now, $"{hop.Destination}으로 이어진 성문을 통과")
+                    ? HoldKey(key, now, $"{hop.Destination}으로 이어진 성문을 통과", allowDash: false)
                     : Wait($"{hop.Destination}으로 이어진 성문에 도착");
             }
 
@@ -713,23 +827,23 @@ sealed class FieldPilot
                 portalStep = FindNextStepBfs(map, x, y, hop.X, hop.Y, now, map, allowGoalOnPort: true);
             }
             return portalStep is FieldKey nextStep
-                ? HoldKey(nextStep, now, $"{hop.Destination}으로 이어진 성문으로 이동")
-                : HoldToward(map, x, y, hop.X, hop.Y, now, $"{hop.Destination}으로 이어진 성문으로 이동", map);
+                ? HoldKey(nextStep, now, $"{hop.Destination}으로 이어진 성문으로 이동", allowDash: safeDash)
+                : HoldToward(map, x, y, hop.X, hop.Y, now, $"{hop.Destination}으로 이어진 성문으로 이동", map, allowDash: safeDash);
         }
 
         FieldKey? step = FindNextStepBfs(map, x, y, waypointX, waypointY, now, map, allowGoalOnPort: false);
         if (step is null)
         {
             MarkBlocked(map, waypointX, waypointY, now, UnreachableTargetTtl);
+            unreachableCells[(map, waypointX / CellSize, waypointY / CellSize)] = now + UnreachableTargetTtl;
             waypointMap = null;
             ChooseUnvisitedWaypoint(map, x, y, now);
             if (waypointMap != map)
                 return MoveOnWall(map, x, y, now);
 
             step = FindNextStepBfs(map, x, y, waypointX, waypointY, now, map, allowGoalOnPort: false);
-            if (step is null)
+            if (step is null && TryClearVisualBlocksOnMap(map, now))
             {
-                ClearVisualBlocksOnMap(map);
                 step = FindNextStepBfs(map, x, y, waypointX, waypointY, now, map, allowGoalOnPort: false);
             }
             if (step is null)
@@ -740,18 +854,26 @@ sealed class FieldPilot
         }
 
         return step is FieldKey moveKey
-            ? HoldKey(moveKey, now, $"{map} 미방문 구역 순찰")
-            : HoldToward(map, x, y, waypointX, waypointY, now, $"{map} 안을 이동", map);
+            ? StabilizePatrolDirection(map, x, y, moveKey, now, $"{map} 미방문 구역 순찰", allowDash: safeDash)
+            : HoldToward(map, x, y, waypointX, waypointY, now, $"{map} 안을 이동", map, allowDash: safeDash);
     }
 
-    private bool HasWaypoint(string map, int x, int y)
+    private bool HasWaypoint(string map, int x, int y, TimeSpan now)
     {
         if (waypointMap is null || !WallAtlas.IsWall(waypointMap))
             return false;
         if (allowedWalls is not null && !allowedWalls.Contains(waypointMap))
             return false;
-        if (waypointMap == map && (waypointX < 0 || Math.Max(Math.Abs(waypointX - x), Math.Abs(waypointY - y)) <= 2))
-            return false;
+        if (waypointMap == map)
+        {
+            if (waypointX < 0 || Math.Max(Math.Abs(waypointX - x), Math.Abs(waypointY - y)) <= 2)
+                return false;
+            if (visitedCells.TryGetValue((map, waypointX / CellSize, waypointY / CellSize), out TimeSpan cellVisit)
+                && now - cellVisit < TimeSpan.FromSeconds(15))
+            {
+                return false;
+            }
+        }
         return true;
     }
 
@@ -829,6 +951,7 @@ sealed class FieldPilot
                 }
             }
 
+            bool deadEndWall = WallAtlas.Maps[map].Ports.Count(port => port.StayOnWall) <= 1;
             bool anyUnvisitedCell = false;
             double bestScore = double.NegativeInfinity;
             int bestX = -1;
@@ -845,14 +968,23 @@ sealed class FieldPilot
                         continue;
 
                     bool visited = visitedCells.TryGetValue((map, cx, cy), out TimeSpan lastVisit);
-                    if (!visited)
+                    bool freshCell = !visited || now - lastVisit >= CellFreshWindow;
+                    if (freshCell)
                         anyUnvisitedCell = true;
 
                     double freshness = !visited
-                        ? 100_000.0
-                        : Math.Min(60_000.0, (now - lastVisit).TotalSeconds * 100.0);
-                    double walkableBonus = knownWalkable.Contains((map, tx, ty)) ? 50_000.0 : 0.0;
-                    double distPenalty = Math.Abs(d - 14) * 2.0;
+                        ? 1_000_000.0
+                        : Math.Min(500_000.0, (now - lastVisit).TotalSeconds * 500.0);
+                    double walkableBonus = knownWalkable.Contains((map, tx, ty)) ? 150.0 : 0.0;
+                    double distPenalty = d * 6.0;
+                    double momentumBonus = lastHeldDirection switch
+                    {
+                        FieldKey.Right when tx > startX => 18.0,
+                        FieldKey.Left when tx < startX => 18.0,
+                        FieldKey.Down when ty > startY => 18.0,
+                        FieldKey.Up when ty < startY => 18.0,
+                        _ => 0.0
+                    };
                     double openSideBonus = lastBlockedDir switch
                     {
                         FieldKey.Left when tx >= startX + 3 => 30.0,
@@ -861,10 +993,18 @@ sealed class FieldPilot
                         FieldKey.Down when ty <= startY - 3 => 30.0,
                         _ => 0.0
                     };
-                    double sweepBias = nextPort is (int px, int py)
-                        ? -0.25 * (Math.Abs(tx - px) + Math.Abs(ty - py))
-                        : 0.0;
-                    double score = freshness + walkableBonus - distPenalty + openSideBonus + sweepBias + (random.NextDouble() * 0.5);
+                    double sweepBias = 0.0;
+                    if (nextPort is (int px, int py))
+                    {
+                        int portDist = Math.Abs(tx - px) + Math.Abs(ty - py);
+                        if (!deadEndWall)
+                            sweepBias = -0.15 * portDist;
+                        else if (freshCellsOnWall < TargetFreshCellsPerVisit / 2)
+                            sweepBias = 1.5 * portDist;
+                        else
+                            sweepBias = -0.8 * portDist;
+                    }
+                    double score = freshness + walkableBonus - distPenalty + momentumBonus + openSideBonus + sweepBias + (random.NextDouble() * 0.5);
                     if (score > bestScore)
                     {
                         bestScore = score;
@@ -878,9 +1018,8 @@ sealed class FieldPilot
         }
 
         var pick = FindBestWaypoint();
-        if (pick.BestX < 0 && visualBlocked.Keys.Any(k => k.Map == map))
+        if (pick.BestX < 0 && visualBlocked.Keys.Any(k => k.Map == map) && TryClearVisualBlocksOnMap(map, now))
         {
-            ClearVisualBlocksOnMap(map);
             pick = FindBestWaypoint();
         }
 
@@ -1155,6 +1294,49 @@ sealed class FieldPilot
         }
     }
 
+    private bool TryClearVisualBlocksOnMap(string map, TimeSpan now)
+    {
+        if (!visualBlocked.Keys.Any(k => k.Map == map))
+            return false;
+        if (lastVisualClearAt.TryGetValue(map, out TimeSpan lastClear)
+            && now - lastClear < TimeSpan.FromSeconds(8))
+        {
+            return false;
+        }
+        lastVisualClearAt[map] = now;
+        visualSuppressUntil[map] = now + TimeSpan.FromSeconds(4);
+        ClearVisualBlocksOnMap(map);
+        return true;
+    }
+
+    private FieldCommand StabilizePatrolDirection(string map, int x, int y, FieldKey candidate, TimeSpan now, string reason, bool allowDash = true)
+    {
+        if (lastHeldDirection is FieldKey prev
+            && IsOpposite(prev, candidate)
+            && lastDirectionChangeAt != TimeSpan.MinValue
+            && now - lastDirectionChangeAt < TimeSpan.FromMilliseconds(350))
+        {
+            (int dx, int dy) = StepDelta(prev);
+            int nx = x + dx;
+            int ny = y + dy;
+            GameMap area = WallAtlas.Maps[map];
+            if (nx >= 0 && nx < area.Width && ny >= 0 && ny < area.Height
+                && !IsBlocked(map, nx, ny, now)
+                && !WallAtlas.IsForbiddenPatrolTile(map, nx, ny, allowedWalls))
+            {
+                return HoldKey(prev, now, reason, allowDash);
+            }
+        }
+        return HoldKey(candidate, now, reason, allowDash);
+    }
+
+    private static bool IsOpposite(FieldKey a, FieldKey b) => (a, b) switch
+    {
+        (FieldKey.Up, FieldKey.Down) or (FieldKey.Down, FieldKey.Up) => true,
+        (FieldKey.Left, FieldKey.Right) or (FieldKey.Right, FieldKey.Left) => true,
+        _ => false
+    };
+
     private void ClearVisualBlocksOnMap(string map)
     {
         foreach (var key in visualBlocked.Keys.Where(k => k.Map == map).ToArray())
@@ -1346,7 +1528,8 @@ sealed class FieldPilot
         int targetY,
         TimeSpan now,
         string reason,
-        string? blockMap)
+        string? blockMap,
+        bool allowDash = true)
     {
         if (lastMap != map || lastX != x || lastY != y)
         {
@@ -1357,7 +1540,7 @@ sealed class FieldPilot
         }
         else if (detourUntil > now && detourDirection is FieldKey activeDetour && CanStep(map, x, y, activeDetour, blockMap))
         {
-            return HoldKey(activeDetour, now, $"{reason} (장애물 우회 중)");
+            return HoldKey(activeDetour, now, $"{reason} (장애물 우회 중)", allowDash);
         }
         else if (lastMovedAt != TimeSpan.MinValue && now - lastMovedAt >= StuckThreshold)
         {
@@ -1367,11 +1550,11 @@ sealed class FieldPilot
             if (detourDirection is FieldKey nextDetour)
             {
                 detourUntil = now + DetourDuration;
-                return HoldKey(nextDetour, now, $"{reason} (길막 감지 후 우회)");
+                return HoldKey(nextDetour, now, $"{reason} (길막 감지 후 우회)", allowDash);
             }
         }
 
-        return HoldToward(map, x, y, targetX, targetY, now, reason, blockMap);
+        return HoldToward(map, x, y, targetX, targetY, now, reason, blockMap, allowDash);
     }
 
     private void ResetStuck(TimeSpan now)
@@ -1384,26 +1567,27 @@ sealed class FieldPilot
         escapeUntil = TimeSpan.MinValue;
         escapeCycleIndex = 0;
         lastEscapeAnchor = null;
+        lastDirectionChangeAt = TimeSpan.MinValue;
         recentWallSteps.Clear();
     }
 
-    private FieldCommand HoldToward(string? map, int x, int y, int targetX, int targetY, TimeSpan now, string reason, string? blockMap)
+    private FieldCommand HoldToward(string? map, int x, int y, int targetX, int targetY, TimeSpan now, string reason, string? blockMap, bool allowDash = true)
     {
-        FieldKey? direction = ChooseDirection(map, x, y, targetX, targetY, blockMap);
+        FieldKey? direction = ChooseDirection(map, x, y, targetX, targetY, blockMap, now);
         if (direction is null)
             return Wait(reason);
-        return HoldKey(direction.Value, now, reason);
+        return HoldKey(direction.Value, now, reason, allowDash);
     }
 
-    private FieldCommand HoldKey(FieldKey direction, TimeSpan now, string reason)
+    private FieldCommand HoldKey(FieldKey direction, TimeSpan now, string reason, bool allowDash = true)
     {
-        bool dash = lastDash == TimeSpan.MinValue || now - lastDash >= DashGap;
+        bool dash = allowDash && (lastDash == TimeSpan.MinValue || now - lastDash >= DashGap);
         if (dash)
             lastDash = now;
         return new FieldCommand(direction, null, dash, reason);
     }
 
-    private FieldCommand HoldAway(string map, int x, int y, TimeSpan now, string reason)
+    private FieldCommand HoldAway(string map, int x, int y, TimeSpan now, string reason, bool allowDash = true)
     {
         GameMap area = WallAtlas.Maps[map];
         int centerX = area.Width / 2;
@@ -1433,28 +1617,36 @@ sealed class FieldPilot
             }
         }
 
-        return bestKey is FieldKey key ? HoldKey(key, now, reason) : Wait(reason);
+        return bestKey is FieldKey key ? HoldKey(key, now, reason, allowDash) : Wait(reason);
     }
 
-    private FieldKey? ChooseDirection(string? map, int x, int y, int targetX, int targetY, string? blockMap)
+    private FieldKey? ChooseDirection(string? map, int x, int y, int targetX, int targetY, string? blockMap, TimeSpan now)
     {
         int dx = Math.Sign(targetX - x);
         int dy = Math.Sign(targetY - y);
         (int X, int Y)[] options = Math.Abs(targetX - x) >= Math.Abs(targetY - y)
             ? [(dx, 0), (0, dy), (-dy, 0), (0, -dx)]
             : [(0, dy), (dx, 0), (0, -dx), (-dy, 0)];
-        foreach ((int stepX, int stepY) in options)
+
+        foreach (bool respectBlocked in new[] { true, false })
         {
-            if (stepX == 0 && stepY == 0)
-                continue;
-            int nextX = x + stepX;
-            int nextY = y + stepY;
-            if (map is not null && WallAtlas.Maps.TryGetValue(map, out GameMap? area)
-                && (nextX < 0 || nextX >= area.Width || nextY < 0 || nextY >= area.Height))
-                continue;
-            if (blockMap is not null && WallAtlas.NearBlockedPort(blockMap, nextX, nextY, allowedWalls))
-                continue;
-            return ToKey(stepX, stepY);
+            foreach ((int stepX, int stepY) in options)
+            {
+                if (stepX == 0 && stepY == 0)
+                    continue;
+                int nextX = x + stepX;
+                int nextY = y + stepY;
+                if (map is not null && WallAtlas.Maps.TryGetValue(map, out GameMap? area)
+                    && (nextX < 0 || nextX >= area.Width || nextY < 0 || nextY >= area.Height))
+                    continue;
+                if (blockMap is not null && WallAtlas.NearBlockedPort(blockMap, nextX, nextY, allowedWalls))
+                    continue;
+                if (respectBlocked && map is not null
+                    && blockedTiles.TryGetValue((map, nextX, nextY), out var entry)
+                    && entry.Until > now)
+                    continue;
+                return ToKey(stepX, stepY);
+            }
         }
         return null;
     }
@@ -1840,6 +2032,7 @@ sealed class FieldInput : IDisposable
         FieldKey.Dash => 0x32,
         FieldKey.Enter => 0x0D,
         FieldKey.Escape => 0x1B,
+        FieldKey.Backspace => 0x08,
         FieldKey.Digit0 => 0x30,
         FieldKey.Digit1 => 0x31,
         FieldKey.Digit2 => 0x32,
@@ -1970,18 +2163,25 @@ static class FieldRehearsal
         CheckCornerTrapEscapesCompletely(failures);
         CheckWall3FlagCorridorTrapEscapes(failures);
         CheckWallVisionGuidesWithoutBumping(failures);
+        CheckWallVisionDetectsLargeOverlayPopup(failures);
         CheckVisionNeverErasesPhysicalBlock(failures);
         CheckPortalRouteNeverErasesPhysicalWallWhenVisionBlocked(failures);
         CheckVisionSkipGuardOnNightTint(failures);
         CheckPatrolWaypointAvoidsPortalCorridor(failures);
         CheckWall2BottleneckEscapesToPortal(failures);
         CheckCenterParchmentModalDetection(failures);
+        CheckVerificationPromptDetection(failures);
         CheckEdgeMarginPreventsWorldMapExit(failures);
         CheckAllFourWallsReachable(failures);
+        CheckWall2NorthExitNeverEntered(failures);
+        CheckPatrolSweepsDeepIntoDeadEndWallWithoutBacktracking(failures);
         CheckSweepVisitsAllFourWallsAndPrefersUnvisited(failures);
         CheckPatrolStaysOnTheWall(failures);
         CheckFieldInputHoldRelease(failures);
         CheckHotkeys(failures);
+        CheckRepairCounterIgnoresAbsentWithoutLowStock(failures);
+        CheckSmithDoorApproachDisablesDashAndAlignsPrecisely(failures);
+        CheckSmithyBuyStepsDownAndClearsOnRetry(failures);
         return failures;
     }
 
@@ -2451,9 +2651,9 @@ static class FieldRehearsal
         int y = 3;
         var now = TimeSpan.Zero;
 
-        // 0틱: 만리장성3 진입, 31초 후 MaxWallSweepTime 만료로 만리장성2 성문(46,0) 목표로 전환
+        // 0틱: 만리장성3 진입, 66초 후 MaxWallSweepTime 만료로 만리장성2 성문(46,0) 목표로 전환
         pilot.Decide(new FieldView(WallAtlas.Wall3, x, y, false, false, now));
-        now = TimeSpan.FromSeconds(31);
+        now = TimeSpan.FromSeconds(66);
 
         var heavyVisualBlocks = new List<TileScan>();
         for (int ty = 0; ty < 22; ty++)
@@ -2511,7 +2711,7 @@ static class FieldRehearsal
         int y = 63;
         var now = TimeSpan.Zero;
         pilot.Decide(new FieldView(WallAtlas.Wall2, x, y, false, false, now));
-        now = TimeSpan.FromSeconds(31);
+        now = TimeSpan.FromSeconds(66);
 
         int minYReached = y;
         for (int step = 0; step < 160; step++)
@@ -2543,8 +2743,14 @@ static class FieldRehearsal
         if (hud.HasCenterParchmentDialog(stoneFrame))
             failures.Add("평범한 돌바닥 화면에서 미확인 대화창이 오검출되었습니다.");
 
-        using var modalFrame = stoneFrame.Clone();
-        Cv2.Rectangle(modalFrame, new Rect(640, 280, 500, 420), new Scalar(80, 145, 190), -1);
+        // Sandstone watchtower fills the center area with warm parchment brick colors but has no dark modal header/list.
+        using var towerFrame = stoneFrame.Clone();
+        Cv2.Rectangle(towerFrame, new Rect(640, 280, 500, 420), new Scalar(80, 145, 190), -1);
+        if (hud.HasCenterParchmentDialog(towerFrame))
+            failures.Add("어두운 제목줄이 없는 사암 망루 배경에서 미확인 대화창이 오검출되었습니다.");
+
+        using var modalFrame = towerFrame.Clone();
+        Cv2.Rectangle(modalFrame, new Rect(660, 280, 480, 38), new Scalar(25, 35, 45), -1);
         if (!hud.HasCenterParchmentDialog(modalFrame))
             failures.Add("중앙 팝업 대화창이 떴는데 감지하지 못했습니다.");
     }
@@ -2579,6 +2785,79 @@ static class FieldRehearsal
             if (outward is null || landedMap != to || WallAtlas.NearExit(landedMap, lx, ly))
                 failures.Add($"성문 연결 {from} -> {to} 좌표 검증 실패");
         }
+    }
+
+    private static void CheckWall2NorthExitNeverEntered(List<string> failures)
+    {
+        if (!WallAtlas.IsForbiddenPatrolTile(WallAtlas.Wall2, 10, 5, null)
+            || !WallAtlas.IsForbiddenPatrolTile(WallAtlas.Wall2, 7, 4, null))
+        {
+            failures.Add("만리장성2 북쪽 세계지도 출구(X=7..10, Y=0) 보호 구역이 충분히 넓지 않습니다.");
+        }
+
+        var pilot = new FieldPilot(new Random(1));
+        int x = 10;
+        int y = 8;
+        int minY = y;
+        var now = TimeSpan.Zero;
+        for (int step = 0; step < 30; step++)
+        {
+            FieldCommand cmd = pilot.Decide(new FieldView(WallAtlas.Wall2, x, y, false, false, now));
+            if (cmd.Hold is FieldKey dir)
+            {
+                (int nx, int ny) = Move(x, y, dir);
+                GameMap area = WallAtlas.Maps[WallAtlas.Wall2];
+                if (nx >= 0 && nx < area.Width && ny >= 0 && ny < area.Height)
+                {
+                    x = nx;
+                    y = ny;
+                    if (y < minY)
+                        minY = y;
+                }
+            }
+            now += TimeSpan.FromMilliseconds(200);
+        }
+
+        if (minY < 5 || y <= 8)
+            failures.Add($"만리장성2 북쪽 출구 부근(10,8)에서 안전하게 안쪽으로 빠지지 못했습니다. minY={minY}, 마지막=({x},{y})");
+    }
+
+    private static void CheckPatrolSweepsDeepIntoDeadEndWallWithoutBacktracking(List<string> failures)
+    {
+        var pilot = new FieldPilot(new Random(1));
+        string map = WallAtlas.Wall1;
+        int x = 1;
+        int y = 7;
+        int maxX = x;
+        var distinctTiles = new HashSet<(int X, int Y)>();
+        var now = TimeSpan.Zero;
+
+        for (int step = 0; step < 300; step++)
+        {
+            if (WallAtlas.WallPort(map, x, y) is not null)
+                break;
+            distinctTiles.Add((x, y));
+            if (x > maxX)
+                maxX = x;
+
+            FieldCommand cmd = pilot.Decide(new FieldView(map, x, y, false, false, now));
+            if (cmd.Hold is FieldKey dir)
+            {
+                (int nx, int ny) = Move(x, y, dir);
+                GameMap area = WallAtlas.Maps[map];
+                if (nx >= 0 && nx < area.Width && ny >= 0 && ny < area.Height)
+                {
+                    if (WallAtlas.WallPort(map, nx, ny) is not null)
+                        break;
+                    x = nx;
+                    y = ny;
+                }
+            }
+            now += TimeSpan.FromMilliseconds(200);
+        }
+
+        if (maxX < 65 || distinctTiles.Count < 180)
+            failures.Add($"만리장성1 깊숙한 미방문 구역으로 전진하지 못했습니다. maxX={maxX}, 방문={distinctTiles.Count}칸");
     }
 
     private static void CheckSweepVisitsAllFourWallsAndPrefersUnvisited(List<string> failures)
@@ -2691,8 +2970,166 @@ static class FieldRehearsal
             failures.Add("키를 떼었을 때는 이벤트가 발생하지 않아야 합니다.");
         if (hotkeys.Update(true, false) != HotkeyEvent.Paused || hotkeys.Running)
             failures.Add("실행 중 F11 키를 다시 누르면 일시정지되어야 합니다.");
+        if (hotkeys.TriggerF11() != HotkeyEvent.Started || !hotkeys.Running)
+            failures.Add("HotkeyWatcher TriggerF11로 시작 상태로 전환되지 않았습니다.");
+        if (hotkeys.TriggerF11() != HotkeyEvent.Paused || hotkeys.Running)
+            failures.Add("HotkeyWatcher TriggerF11로 일시정지 상태로 전환되지 않았습니다.");
         if (hotkeys.Update(false, true) != HotkeyEvent.Exit || !hotkeys.ExitRequested || hotkeys.Running)
             failures.Add("END 키를 누르면 즉시 종료 상태로 전환되어야 합니다.");
+        if (hotkeys.TriggerExit() != HotkeyEvent.Exit || !hotkeys.ExitRequested || hotkeys.Running)
+            failures.Add("HotkeyWatcher TriggerExit가 종료 이벤트를 반환하지 않았습니다.");
+    }
+
+    private static void CheckVerificationPromptDetection(List<string> failures)
+    {
+        string promptPath = Path.Combine(BundledFiles.TemplateDirectory, "character-prompt.png");
+        if (!File.Exists(promptPath))
+        {
+            failures.Add("character-prompt.png 템플릿을 찾을 수 없습니다.");
+            return;
+        }
+
+        using var screen = new RepairScreen();
+        using var blank = new Mat(1080, 1920, MatType.CV_8UC3, new Scalar(120, 125, 130));
+        if (screen.IsVerificationPromptOpen(blank))
+            failures.Add("허풍선 안내 문구가 없는 빈 화면에서 오검출되었습니다.");
+
+        using var prompt = Cv2.ImRead(promptPath, ImreadModes.Color);
+        if (prompt.Empty())
+        {
+            failures.Add("character-prompt.png를 불러오지 못했습니다.");
+            return;
+        }
+
+        foreach ((int px, int py) in new[] { (640, 860), (220, 180) })
+        {
+            using var canvas = blank.Clone();
+            using var dst = new Mat(canvas, new Rect(px, py, prompt.Width, prompt.Height));
+            prompt.CopyTo(dst);
+            if (!screen.IsVerificationPromptOpen(canvas))
+                failures.Add($"({px},{py}) 위치의 허풍선 안내 문구를 감지하지 못했습니다.");
+        }
+    }
+
+    private static void CheckRepairCounterIgnoresAbsentWithoutLowStock(List<string> failures)
+    {
+        var neverSeen = new RepairCounter(100);
+        neverSeen.ObserveStock(BrickStock.Absent, TimeSpan.Zero);
+        neverSeen.ObserveStock(BrickStock.Absent, TimeSpan.FromSeconds(5));
+        if (neverSeen.NeedsBricks)
+            failures.Add("재고가 한 번도 낮음(1~2개)으로 관측되지 않았는데 Absent만으로 보급을 시작했습니다.");
+
+        var scrolledAway = new RepairCounter(100);
+        scrolledAway.ObserveStock(BrickStock.QuantityVisible, TimeSpan.Zero);
+        scrolledAway.ObserveStock(BrickStock.Absent, TimeSpan.FromSeconds(1));
+        scrolledAway.ObserveStock(BrickStock.Absent, TimeSpan.FromSeconds(5));
+        if (scrolledAway.NeedsBricks)
+            failures.Add("벽돌 3개 이상(QuantityVisible) 상태에서 일시적 Absent로 보급을 시작했습니다.");
+
+        var trulyDepleted = new RepairCounter(100);
+        trulyDepleted.ObserveStock(BrickStock.One, TimeSpan.Zero);
+        trulyDepleted.ObserveStock(BrickStock.Absent, TimeSpan.FromSeconds(1));
+        trulyDepleted.ObserveStock(BrickStock.Absent, TimeSpan.FromSeconds(5));
+        if (!trulyDepleted.NeedsBricks)
+            failures.Add("벽돌 1개 관측 뒤 Absent가 3초 지속됐는데도 보급을 시작하지 않았습니다.");
+    }
+
+    private static void CheckSmithDoorApproachDisablesDashAndAlignsPrecisely(List<string> failures)
+    {
+        var pilot = new FieldPilot(new Random(1));
+        var t = TimeSpan.Zero;
+        pilot.Decide(new FieldView(WallAtlas.Wall3, 16, 46, true, false, t));
+        pilot.Decide(new FieldView(WallAtlas.Wall3, 16, 46, true, false, t += TimeSpan.FromMilliseconds(250)));
+        pilot.Decide(new FieldView(WallAtlas.Guknae, 204, 108, true, false, t += TimeSpan.FromMilliseconds(250)));
+        pilot.Decide(new FieldView(WallAtlas.Guknae, 204, 108, true, false, t += TimeSpan.FromMilliseconds(250)));
+        pilot.Decide(new FieldView(WallAtlas.Guknae, 204, 108, true, false, t += TimeSpan.FromMilliseconds(200)));
+        pilot.Decide(new FieldView(WallAtlas.Guknae, 16, 108, true, false, t += TimeSpan.FromMilliseconds(200)));
+        pilot.Decide(new FieldView(WallAtlas.Guknae, 40, 108, true, false, t += TimeSpan.FromMilliseconds(200)));
+        pilot.Decide(new FieldView(WallAtlas.Guknae, 40, 121, true, false, t += TimeSpan.FromMilliseconds(200)));
+        pilot.Decide(new FieldView(WallAtlas.Guknae, 53, 122, true, false, t += TimeSpan.FromMilliseconds(200)));
+
+        FieldCommand wallStep = pilot.Decide(new FieldView(WallAtlas.Guknae, 55, 121, true, false, t += TimeSpan.FromSeconds(2)));
+        if (wallStep.Hold != FieldKey.Down || wallStep.Dash)
+            failures.Add($"대장간 건물 벽(55,121)에서 옆으로 비비지 말고 아래쪽 도로로 내려와야 합니다. actual={wallStep.Hold}/{wallStep.Tap}/Dash={wallStep.Dash}");
+
+        FieldCommand alignStep = pilot.Decide(new FieldView(WallAtlas.Guknae, 57, 123, true, false, t += TimeSpan.FromSeconds(2)));
+        if (alignStep.Tap != FieldKey.Right || alignStep.Hold is not null || alignStep.Dash)
+            failures.Add($"대장간 입구 아래(57,123)에서 풍신보 없이 1칸씩 정렬해야 합니다. actual={alignStep.Hold}/{alignStep.Tap}/Dash={alignStep.Dash}");
+
+        FieldCommand enterFromBelow = pilot.Decide(new FieldView(WallAtlas.Guknae, 59, 123, true, false, t += TimeSpan.FromMilliseconds(250)));
+        if (enterFromBelow.Hold != FieldKey.Up || !enterFromBelow.Dash)
+            failures.Add($"대장간 입구 아래(59,123)에서 위+풍신보로 들어가야 합니다. actual={enterFromBelow.Hold}/Dash={enterFromBelow.Dash}");
+
+        FieldCommand enterAtDoor = pilot.Decide(new FieldView(WallAtlas.Guknae, 59, 121, true, false, t += TimeSpan.FromSeconds(1.1)));
+        if (enterAtDoor.Hold != FieldKey.Up || !enterAtDoor.Dash)
+            failures.Add($"대장간 문(59,121)에서 위+풍신보로 들어가야 합니다. actual={enterAtDoor.Hold}/Dash={enterAtDoor.Dash}");
+    }
+
+    private static void CheckSmithyBuyStepsDownAndClearsOnRetry(List<string> failures)
+    {
+        var pilot = new FieldPilot(new Random(1));
+        var t = TimeSpan.Zero;
+        pilot.Decide(new FieldView(WallAtlas.Wall3, 16, 46, true, false, t));
+        pilot.Decide(new FieldView(WallAtlas.Wall3, 16, 46, true, false, t += TimeSpan.FromMilliseconds(250)));
+        pilot.Decide(new FieldView(WallAtlas.Guknae, 204, 108, true, false, t += TimeSpan.FromMilliseconds(250)));
+        pilot.Decide(new FieldView(WallAtlas.Guknae, 204, 108, true, false, t += TimeSpan.FromMilliseconds(250)));
+        pilot.Decide(new FieldView(WallAtlas.Guknae, 204, 108, true, false, t += TimeSpan.FromMilliseconds(200)));
+        pilot.Decide(new FieldView(WallAtlas.Guknae, 16, 108, true, false, t += TimeSpan.FromMilliseconds(200)));
+        pilot.Decide(new FieldView(WallAtlas.Smith, 5, 9, true, false, t += TimeSpan.FromMilliseconds(200)));
+
+        // Attempt 1: 100
+        pilot.Decide(new FieldView(WallAtlas.Smith, 5, 9, true, false, t += TimeSpan.FromMilliseconds(200), SmithyDialog: SmithyDialogState.QuantityPrompt));
+        pilot.Decide(new FieldView(WallAtlas.Smith, 5, 9, true, false, t += TimeSpan.FromMilliseconds(150), SmithyDialog: SmithyDialogState.QuantityPrompt));
+        pilot.Decide(new FieldView(WallAtlas.Smith, 5, 9, true, false, t += TimeSpan.FromMilliseconds(150), SmithyDialog: SmithyDialogState.QuantityPrompt));
+        FieldCommand enter1 = pilot.Decide(new FieldView(WallAtlas.Smith, 5, 9, true, false, t += TimeSpan.FromMilliseconds(150), SmithyDialog: SmithyDialogState.QuantityPrompt));
+        if (enter1.Tap != FieldKey.Enter)
+            failures.Add("1차 시도에서 Enter 확정이 나가지 않았습니다.");
+
+        // Rejected after 2s: must transition to 80 and clear with Backspace before typing digits.
+        pilot.Decide(new FieldView(WallAtlas.Smith, 5, 9, true, false, t += TimeSpan.FromSeconds(2.1), SmithyDialog: SmithyDialogState.QuantityPrompt));
+        var taps = new List<FieldKey>();
+        for (int i = 0; i < 10; i++)
+        {
+            FieldCommand c = pilot.Decide(new FieldView(WallAtlas.Smith, 5, 9, true, false, t += TimeSpan.FromMilliseconds(150), SmithyDialog: SmithyDialogState.QuantityPrompt));
+            if (c.Tap is FieldKey k)
+                taps.Add(k);
+        }
+        int backspaces = taps.Count(k => k == FieldKey.Backspace);
+        var typedDigits = taps.Where(k => k != FieldKey.Backspace).ToArray();
+        if (backspaces < 6 || typedDigits.Length < 3 || typedDigits[0] != FieldKey.Digit8 || typedDigits[1] != FieldKey.Digit0 || typedDigits[2] != FieldKey.Enter)
+            failures.Add($"재시도 시 Backspace 초기화 후 80+Enter를 입력해야 합니다. backspaces={backspaces}, taps={string.Join(",", taps)}");
+    }
+
+    private static void CheckWallVisionDetectsLargeOverlayPopup(List<string> failures)
+    {
+        var vision = new WallVision();
+        using var cleanFrame = new Mat(1080, 1920, MatType.CV_8UC3, new Scalar(150, 150, 150));
+        List<TileScan> cleanScans = vision.Scan(cleanFrame, WallAtlas.Wall4, 50, 15);
+        if (vision.HasLargeOverlay || cleanScans.Count < 280)
+            failures.Add($"정상 성벽 화면에서 팝업 오탐 또는 스캔 부족: overlay={vision.HasLargeOverlay}, scans={cleanScans.Count}");
+
+        using (var brightPopup = cleanFrame.Clone())
+        {
+            Cv2.Rectangle(brightPopup, new Rect(470, 230, 520, 380), new Scalar(235, 240, 245), -1);
+            List<TileScan> scans = vision.Scan(brightPopup, WallAtlas.Wall4, 50, 15);
+            if (!vision.HasLargeOverlay || scans.Count != 0)
+                failures.Add($"중앙 밝은 미니게임 팝업을 감지하지 못했습니다. overlay={vision.HasLargeOverlay}, reason={vision.LastOverlayReason}, scans={scans.Count}");
+        }
+
+        using (var darkPopup = cleanFrame.Clone())
+        {
+            Cv2.Rectangle(darkPopup, new Rect(470, 230, 520, 380), new Scalar(18, 18, 22), -1);
+            List<TileScan> scans = vision.Scan(darkPopup, WallAtlas.Wall4, 50, 15);
+            if (!vision.HasLargeOverlay || scans.Count != 0)
+                failures.Add($"중앙 어두운 모달 팝업을 감지하지 못했습니다. overlay={vision.HasLargeOverlay}, reason={vision.LastOverlayReason}, scans={scans.Count}");
+        }
+
+        using (var blackout = new Mat(1080, 1920, MatType.CV_8UC3, new Scalar(5, 5, 5)))
+        {
+            _ = vision.Scan(blackout, WallAtlas.Wall4, 50, 15);
+            if (vision.HasLargeOverlay)
+                failures.Add("맵 이동 암전 화면을 팝업으로 오탐했습니다.");
+        }
     }
 
     private static (int X, int Y) Move(int x, int y, FieldKey direction) => direction switch

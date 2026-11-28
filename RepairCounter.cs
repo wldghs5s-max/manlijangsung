@@ -16,6 +16,7 @@ sealed class RepairCounter
     private bool resultReported;
     private bool autoStockTriggered;
     private int visibleStockStreak;
+    private BrickStock lastVisibleStock = BrickStock.Unknown;
     private TimeSpan absentSince = TimeSpan.MinValue;
 
     public RepairCounter(int purchaseQuantity) => this.purchaseQuantity = purchaseQuantity;
@@ -57,6 +58,8 @@ sealed class RepairCounter
         {
             Complete();
             BrickStock stock = screen.ReadStock(frame);
+            if (stock is BrickStock.One or BrickStock.Two or BrickStock.QuantityVisible)
+                lastVisibleStock = stock;
             crack = (candidateSince, stock);
             lastCrackSeen = time;
             resultReported = false;
@@ -68,6 +71,9 @@ sealed class RepairCounter
             return;
 
         BrickStock stockAfter = screen.ReadStock(frame);
+        BrickStock priorVisibleStock = lastVisibleStock;
+        if (stockAfter is BrickStock.One or BrickStock.Two or BrickStock.QuantityVisible)
+            lastVisibleStock = stockAfter;
         string inventory = crack is { } observedCrack
             ? $"{StockText(observedCrack.Stock)} → {StockText(stockAfter)}"
             : StockText(stockAfter);
@@ -77,10 +83,12 @@ sealed class RepairCounter
         consumedSinceSupply++;
         Write(candidateSince, $"벽돌 1개 소모 (누적 {Consumed}개)", "수리 대화에서 벽돌 사용 확인", inventory);
 
-        if (stockAfter != BrickStock.Absent && consumedSinceSupply < purchaseQuantity)
+        bool depletedFromLow = stockAfter == BrickStock.Absent
+            && priorVisibleStock is BrickStock.One or BrickStock.Two;
+        if (!depletedFromLow && consumedSinceSupply < purchaseQuantity)
             return;
 
-        string reason = stockAfter == BrickStock.Absent
+        string reason = depletedFromLow
             ? "소지품에서 벽돌 항목이 사라짐"
             : $"이번 구매분에서 벽돌 {consumedSinceSupply}개 소모";
         Refills++;
@@ -95,6 +103,11 @@ sealed class RepairCounter
         if (stock == BrickStock.Absent)
         {
             visibleStockStreak = 0;
+            if (lastVisibleStock is not (BrickStock.One or BrickStock.Two))
+            {
+                absentSince = TimeSpan.MinValue;
+                return;
+            }
             if (absentSince == TimeSpan.MinValue)
                 absentSince = time;
             else if (time - absentSince >= TimeSpan.FromSeconds(3))
@@ -111,6 +124,7 @@ sealed class RepairCounter
         absentSince = TimeSpan.MinValue;
         if (stock is BrickStock.One or BrickStock.Two or BrickStock.QuantityVisible)
         {
+            lastVisibleStock = stock;
             visibleStockStreak++;
             if (allowAutoCancel && autoStockTriggered && NeedsBricks && visibleStockStreak >= 2)
             {
@@ -129,6 +143,7 @@ sealed class RepairCounter
         NeedsBricks = false;
         autoStockTriggered = false;
         visibleStockStreak = 0;
+        lastVisibleStock = BrickStock.Unknown;
         consumedSinceSupply = 0;
         absentSince = TimeSpan.MinValue;
     }

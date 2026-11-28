@@ -26,7 +26,7 @@ sealed class RepairScreen : IDisposable
     private static readonly Rect DialogArea = new(754, 345, 300, 58);
     private static readonly Rect InventoryRowArea = new(1500, 129, 120, 30);
     private static readonly Rect BrickNameCrop = new(68, 0, 52, 30);
-    private static readonly Rect InventoryNameScanArea = new(1560, 129, 68, 440);
+    private static readonly Rect InventoryNameScanArea = new(1545, 110, 110, 550);
     private static readonly Rect InventoryInteriorArea = new(1500, 129, 240, 280);
     private static readonly Rect QuantityArea = new(1620, 129, 118, 30);
 
@@ -38,9 +38,17 @@ sealed class RepairScreen : IDisposable
     private readonly Mat brickNameGray;
     private readonly Mat nextRow;
     private readonly Mat two;
+    private readonly Mat? promptGray;
+    private readonly Mat? promptMask;
+    private readonly Mat? promptHalf;
     private readonly Mat crop = new();
     private readonly Mat inventoryMask = new();
     private readonly Mat match = new();
+    private readonly Mat fullGray = new();
+    private readonly Mat halfGray = new();
+    private readonly Mat halfMatch = new();
+    private readonly Mat promptRoiMask = new();
+    private readonly Mat promptRoiMatch = new();
 
     public RepairScreen()
     {
@@ -61,6 +69,70 @@ sealed class RepairScreen : IDisposable
         brickName = nameSlice.Clone();
         nextRow = LoadMask(Path.Combine(templates, "next-row.png"), InventoryRowArea, BrightTextThreshold, ThresholdTypes.Binary);
         two = LoadMask(Path.Combine(templates, "brick-count-two.png"), QuantityArea, BrightTextThreshold, ThresholdTypes.Binary);
+
+        string promptPath = Path.Combine(templates, "character-prompt.png");
+        if (File.Exists(promptPath))
+        {
+            using Mat promptRaw = Cv2.ImDecode(File.ReadAllBytes(promptPath), ImreadModes.Grayscale);
+            if (!promptRaw.Empty() && promptRaw.Width >= 450 && promptRaw.Height >= 24)
+            {
+                using var banner = new Mat(promptRaw, new Rect(0, 0, 450, 24));
+                promptGray = banner.Clone();
+                promptMask = new Mat();
+                Cv2.Threshold(promptGray, promptMask, TextThreshold, 255, ThresholdTypes.BinaryInv);
+                promptHalf = new Mat();
+                Cv2.Resize(promptGray, promptHalf, new Size(225, 12), 0, 0, InterpolationFlags.Area);
+            }
+        }
+    }
+
+    public bool IsVerificationPromptOpen(Mat frame)
+    {
+        if (promptGray is null || promptMask is null || promptHalf is null
+            || frame.Width != 1920 || frame.Height != 1080)
+        {
+            return false;
+        }
+
+        Cv2.CvtColor(frame, fullGray, ColorConversionCodes.BGR2GRAY);
+        Cv2.Resize(fullGray, halfGray, new Size(960, 540), 0, 0, InterpolationFlags.Area);
+        Cv2.MatchTemplate(halfGray, promptHalf, halfMatch, TemplateMatchModes.CCoeffNormed);
+
+        for (int peak = 0; peak < 3; peak++)
+        {
+            Cv2.MinMaxLoc(halfMatch, out _, out double coarseScore, out _, out Point coarseLoc);
+            if (coarseScore < 0.42)
+                break;
+
+            int rx = Math.Clamp((coarseLoc.X * 2) - 24, 0, 1920 - promptGray.Width);
+            int ry = Math.Clamp((coarseLoc.Y * 2) - 16, 0, 1080 - promptGray.Height);
+            int rw = Math.Min(promptGray.Width + 48, 1920 - rx);
+            int rh = Math.Min(promptGray.Height + 32, 1080 - ry);
+
+            using var roi = new Mat(fullGray, new Rect(rx, ry, rw, rh));
+            Cv2.MatchTemplate(roi, promptGray, promptRoiMatch, TemplateMatchModes.CCoeffNormed);
+            Cv2.MinMaxLoc(promptRoiMatch, out _, out double grayScore, out _, out _);
+            if (grayScore >= 0.65)
+                return true;
+
+            Cv2.Threshold(roi, promptRoiMask, TextThreshold, 255, ThresholdTypes.BinaryInv);
+            Cv2.MatchTemplate(promptRoiMask, promptMask, promptRoiMatch, TemplateMatchModes.CCoeffNormed);
+            Cv2.MinMaxLoc(promptRoiMatch, out _, out double maskScore, out _, out _);
+            if (maskScore >= 0.65)
+                return true;
+
+            int sx = Math.Max(0, coarseLoc.X - 24);
+            int sy = Math.Max(0, coarseLoc.Y - 8);
+            int sw = Math.Min(halfMatch.Width - sx, 49);
+            int sh = Math.Min(halfMatch.Height - sy, 17);
+            if (sw > 0 && sh > 0)
+            {
+                using var patch = new Mat(halfMatch, new Rect(sx, sy, sw, sh));
+                patch.SetTo(Scalar.All(-1.0));
+            }
+        }
+
+        return false;
     }
 
     public bool IsDialogPanelOpen(Mat frame)
@@ -111,7 +183,7 @@ sealed class RepairScreen : IDisposable
         Cv2.MinMaxLoc(match, out _, out double grayScore, out _, out Point grayLoc);
 
         int foundY = -1;
-        if (grayScore >= 0.78)
+        if (grayScore >= 0.74)
         {
             foundY = grayLoc.Y;
         }
@@ -120,7 +192,7 @@ sealed class RepairScreen : IDisposable
             Cv2.Threshold(crop, crop, BrightTextThreshold, 255, ThresholdTypes.Binary);
             Cv2.MatchTemplate(crop, brickName, match, TemplateMatchModes.CCoeffNormed);
             Cv2.MinMaxLoc(match, out _, out double brickScore, out _, out Point brickLoc);
-            if (brickScore >= 0.80)
+            if (brickScore >= 0.76)
                 foundY = brickLoc.Y;
         }
 
@@ -191,8 +263,16 @@ sealed class RepairScreen : IDisposable
         brickNameGray.Dispose();
         nextRow.Dispose();
         two.Dispose();
+        promptGray?.Dispose();
+        promptMask?.Dispose();
+        promptHalf?.Dispose();
         crop.Dispose();
         inventoryMask.Dispose();
         match.Dispose();
+        fullGray.Dispose();
+        halfGray.Dispose();
+        halfMatch.Dispose();
+        promptRoiMask.Dispose();
+        promptRoiMatch.Dispose();
     }
 }

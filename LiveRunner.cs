@@ -42,7 +42,110 @@ sealed class HotkeyState
         return HotkeyEvent.None;
     }
 
+    public HotkeyEvent TriggerF11()
+    {
+        Running = !Running;
+        return Running ? HotkeyEvent.Started : HotkeyEvent.Paused;
+    }
+
+    public HotkeyEvent TriggerExit()
+    {
+        ExitRequested = true;
+        Running = false;
+        return HotkeyEvent.Exit;
+    }
+
     public void ForcePause() => Running = false;
+}
+
+sealed class HotkeyWatcher : IDisposable
+{
+    private const int VkEnd = 0x23;
+    private const int VkF11 = 0x7A;
+    private readonly Func<int, short> pollKey;
+    private readonly CancellationTokenSource stopCts = new();
+    private readonly Thread thread;
+    private int pendingF11;
+    private int pendingEnd;
+
+    public HotkeyWatcher(Func<int, short> pollKey)
+    {
+        this.pollKey = pollKey;
+        // Drain any stale key-tap latch accumulated before starting the watcher.
+        _ = pollKey(VkF11);
+        _ = pollKey(VkEnd);
+        thread = new Thread(WatchLoop)
+        {
+            IsBackground = true,
+            Name = "HotkeyWatcher"
+        };
+        thread.Start();
+    }
+
+    public bool HasPending =>
+        Volatile.Read(ref pendingEnd) != 0 || Volatile.Read(ref pendingF11) != 0;
+
+    public HotkeyEvent Poll(HotkeyState state)
+    {
+        if (Interlocked.Exchange(ref pendingEnd, 0) != 0)
+            return state.TriggerExit();
+        if (Interlocked.Exchange(ref pendingF11, 0) != 0)
+            return state.TriggerF11();
+        return HotkeyEvent.None;
+    }
+
+    public void SleepInterruptible(int totalMs, CancellationToken token)
+    {
+        int remaining = totalMs;
+        while (remaining > 0 && !token.IsCancellationRequested && !HasPending)
+        {
+            int slice = Math.Min(remaining, 15);
+            Thread.Sleep(slice);
+            remaining -= slice;
+        }
+    }
+
+    private void WatchLoop()
+    {
+        bool prevF11 = (pollKey(VkF11) & 0x8000) != 0;
+        bool prevEnd = (pollKey(VkEnd) & 0x8000) != 0;
+        long lastF11Ms = 0;
+        long lastEndMs = 0;
+
+        while (!stopCts.IsCancellationRequested)
+        {
+            short sF11 = pollKey(VkF11);
+            short sEnd = pollKey(VkEnd);
+            bool f11Down = (sF11 & 0x8000) != 0;
+            bool f11Tapped = (sF11 & 0x0001) != 0;
+            bool endDown = (sEnd & 0x8000) != 0;
+            bool endTapped = (sEnd & 0x0001) != 0;
+            long nowMs = Environment.TickCount64;
+
+            if (((f11Down && !prevF11) || (!prevF11 && f11Tapped)) && nowMs - lastF11Ms >= 250)
+            {
+                lastF11Ms = nowMs;
+                Interlocked.Exchange(ref pendingF11, 1);
+            }
+            if (((endDown && !prevEnd) || (!prevEnd && endTapped)) && nowMs - lastEndMs >= 250)
+            {
+                lastEndMs = nowMs;
+                Interlocked.Exchange(ref pendingEnd, 1);
+            }
+
+            prevF11 = f11Down;
+            prevEnd = endDown;
+            Thread.Sleep(15);
+        }
+    }
+
+    public void Dispose()
+    {
+        stopCts.Cancel();
+        if (thread.IsAlive)
+            thread.Join(200);
+        stopCts.Dispose();
+    }
 }
 
 sealed class LiveOptions
@@ -84,6 +187,7 @@ static class LiveRunner
         var counter = new RepairCounter(options.PurchaseQuantity);
         var pilot = new FieldPilot(new Random(), hud.SupportedWalls, options.PurchaseQuantity);
         var hotkey = new HotkeyState();
+        using var hotkeyWatcher = new HotkeyWatcher(GetAsyncKeyState);
         var clock = Stopwatch.StartNew();
 
         using var raw = new Mat();
@@ -102,6 +206,7 @@ static class LiveRunner
         int? lastKnownY = null;
         TimeSpan lastKnownAt = TimeSpan.MinValue;
         TimeSpan unknownDialogSince = TimeSpan.MinValue;
+        TimeSpan overlayPopupSince = TimeSpan.MinValue;
         bool loggedCaptureSize = false;
         bool warnedFocus = false;
         bool wasInBuy = false;
@@ -125,9 +230,7 @@ static class LiveRunner
         {
             while (!cts.IsCancellationRequested)
             {
-                bool f11Down = (GetAsyncKeyState(VkF11) & 0x8000) != 0;
-                bool endDown = (GetAsyncKeyState(VkEnd) & 0x8000) != 0;
-                HotkeyEvent ev = hotkey.Update(f11Down, endDown);
+                HotkeyEvent ev = hotkeyWatcher.Poll(hotkey);
 
                 if (ev == HotkeyEvent.Exit)
                 {
@@ -166,6 +269,7 @@ static class LiveRunner
                     lastKnownY = null;
                     lastKnownAt = TimeSpan.MinValue;
                     unknownDialogSince = TimeSpan.MinValue;
+                    overlayPopupSince = TimeSpan.MinValue;
                     loggedCaptureSize = false;
                     warnedFocus = false;
                     puzzleFocusLogged = false;
@@ -180,12 +284,13 @@ static class LiveRunner
                     lastReason = null;
                     lastHold = null;
                     unknownDialogSince = TimeSpan.MinValue;
+                    overlayPopupSince = TimeSpan.MinValue;
                     log.Write("[일시정지] F11: 재개 | END: 종료");
                 }
 
                 if (!hotkey.Running)
                 {
-                    Thread.Sleep(50);
+                    hotkeyWatcher.SleepInterruptible(50, cts.Token);
                     continue;
                 }
 
@@ -322,6 +427,7 @@ static class LiveRunner
 
                     int walkableCount = 0;
                     int blockedScanCount = 0;
+                    bool largeOverlay = false;
                     if (map is not null
                         && WallAtlas.IsWall(map)
                         && x is int px
@@ -334,18 +440,42 @@ static class LiveRunner
                         && !puzzleArchive.Capturing)
                     {
                         List<TileScan> scans = vision.Scan(normalized, map, px, py);
-                        pilot.ObserveTerrain(map, scans, now);
-                        foreach (TileScan scan in scans)
+                        largeOverlay = vision.HasLargeOverlay;
+                        if (!largeOverlay)
                         {
-                            if (scan.Walkable)
-                                walkableCount++;
-                            else
-                                blockedScanCount++;
+                            pilot.ObserveTerrain(map, scans, now);
+                            foreach (TileScan scan in scans)
+                            {
+                                if (scan.Walkable)
+                                    walkableCount++;
+                                else
+                                    blockedScanCount++;
+                            }
                         }
                     }
 
+                    if (largeOverlay)
+                    {
+                        if (overlayPopupSince == TimeSpan.MinValue)
+                            overlayPopupSince = now;
+                        else if (now - overlayPopupSince >= TimeSpan.FromMilliseconds(500))
+                        {
+                            input.ReleaseAll();
+                            hotkey.ForcePause();
+                            overlayPopupSince = TimeSpan.MinValue;
+                            log.Write($"[{now:hh\\:mm\\:ss}] [자동 일시정지] 화면 중앙에 미확인 팝업/허풍선 창({vision.LastOverlayReason})이 감지되어 이동을 즉시 멈추고 일시정지합니다. 직접 처리한 뒤 게임 창에서 F11 키를 눌러 재개하세요.");
+                            AlertSound.Play();
+                            Thread.Sleep(100);
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        overlayPopupSince = TimeSpan.MinValue;
+                    }
+
                     counter.Observe(screen, normalized, now);
-                    if (map is not null && !worldMap && dialog == RepairDialog.None && !returnConfirm && !unknownDialog && !puzzleOpen && !puzzleArchive.Capturing)
+                    if (map is not null && !worldMap && dialog == RepairDialog.None && !returnConfirm && !unknownDialog && !largeOverlay && !puzzleOpen && !puzzleArchive.Capturing)
                         counter.ObserveStock(stock, now, allowAutoCancel: !pilot.IsSupplying || !pilot.InBuyPhase);
 
                     var view = new FieldView(
@@ -353,7 +483,7 @@ static class LiveRunner
                         x,
                         y,
                         counter.NeedsBricks,
-                        UiBlocked: unknownDialog,
+                        UiBlocked: unknownDialog || largeOverlay,
                         now,
                         RepairDialogOpen: dialog != RepairDialog.None,
                         WorldMapOpen: worldMap,
@@ -464,7 +594,7 @@ static class LiveRunner
                     Thread.Sleep(250);
                 }
 
-                Thread.Sleep(puzzleBusy ? 20 : 100);
+                hotkeyWatcher.SleepInterruptible(puzzleBusy ? 20 : 100, cts.Token);
             }
         }
         finally

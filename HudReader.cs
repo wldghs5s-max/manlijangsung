@@ -159,7 +159,52 @@ sealed class HudReader : IDisposable
             }
         }
 
-        return totalSamples > 0 && (double)parchCount / totalSamples >= 0.25;
+        if (totalSamples == 0 || (double)parchCount / totalSamples < 0.25)
+            return false;
+
+        // Require a real dark horizontal modal title bar or a dark inner list box so warm
+        // sandstone towers in the field do not trigger false unknown-popup alerts.
+        int titleXStart = 680;
+        int titleWidth = 440;
+        byte[] titleBuffer = new byte[titleWidth * 3];
+        for (int y = 140; y <= 360; y += 2)
+        {
+            nint rowPtr = frame.Data + (y * stride) + (titleXStart * 3);
+            System.Runtime.InteropServices.Marshal.Copy(rowPtr, titleBuffer, 0, titleBuffer.Length);
+            int dark = 0;
+            int samples = 0;
+            for (int dx = 0; dx < titleWidth; dx += 2)
+            {
+                int off = dx * 3;
+                int sum = titleBuffer[off] + titleBuffer[off + 1] + titleBuffer[off + 2];
+                if (sum < 165)
+                    dark++;
+                samples++;
+            }
+            if (samples > 0 && (double)dark / samples >= 0.80)
+                return true;
+        }
+
+        int innerXStart = 700;
+        int innerWidth = 420;
+        byte[] innerBuffer = new byte[innerWidth * 3];
+        int innerDark = 0;
+        int innerTotal = 0;
+        for (int y = 380; y <= 620; y += 2)
+        {
+            nint rowPtr = frame.Data + (y * stride) + (innerXStart * 3);
+            System.Runtime.InteropServices.Marshal.Copy(rowPtr, innerBuffer, 0, innerBuffer.Length);
+            for (int dx = 0; dx < innerWidth; dx += 2)
+            {
+                int off = dx * 3;
+                int sum = innerBuffer[off] + innerBuffer[off + 1] + innerBuffer[off + 2];
+                if (sum < 120)
+                    innerDark++;
+                innerTotal++;
+            }
+        }
+
+        return innerTotal > 0 && (double)innerDark / innerTotal >= 0.45;
     }
 
     public bool IsWorldMap(Mat frame)

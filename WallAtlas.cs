@@ -11,6 +11,7 @@ sealed class GameMap
 static class WallAtlas
 {
     public const int ExitBuffer = 2;
+    public const int PatrolExitBuffer = 8;
     public const int EdgeBuffer = 3;
     public const string Wall1 = "만리장성1";
     public const string Wall2 = "만리장성2";
@@ -33,7 +34,8 @@ static class WallAtlas
         [Wall2] = Map("만리장성2", 30, 100,
             Port(29, 20, Wall1, true, FieldKey.Right, 1, 7),
             Port(8, 99, Wall3, true, FieldKey.Down, 46, 2),
-            Port(7, 0, "세계지도", false)),
+            Port(7, 0, "세계지도", false),
+            Port(10, 0, "세계지도", false)),
         [Wall3] = Map("만리장성3", 60, 50,
             Port(46, 0, Wall2, true, FieldKey.Up, 8, 97),
             Port(7, 0, Wall4, true, FieldKey.Up, 85, 27),
@@ -78,9 +80,21 @@ static class WallAtlas
         return false;
     }
 
+    public static bool IsNearWorldExit(string map, int x, int y, int radius, IReadOnlySet<string>? allowedWalls = null)
+    {
+        foreach (MapPort port in Maps[map].Ports)
+        {
+            if (port.StayOnWall)
+                continue;
+            if (Math.Max(Math.Abs(port.X - x), Math.Abs(port.Y - y)) <= radius)
+                return true;
+        }
+        return false;
+    }
+
     public static bool IsForbiddenPatrolTile(string map, int x, int y, IReadOnlySet<string>? allowedWalls)
     {
-        if (NearBlockedPort(map, x, y, allowedWalls))
+        if (NearBlockedPort(map, x, y, allowedWalls) || IsNearWorldExit(map, x, y, PatrolExitBuffer, allowedWalls))
             return true;
         if (WallPort(map, x, y) is not null)
             return true;
